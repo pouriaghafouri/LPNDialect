@@ -14,9 +14,9 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "LPN/Dialect/LPNAttributes.h"
-#include "hcl/Dialect/LPNTypes.h"
+#include "LPN/Dialect/LPNTypes.h"
 
 #define GET_OP_CLASSES
-#include "hcl/Dialect/LPNOps.h.inc"
+#include "LPN/Dialect/LPNOps.h.inc"
 
 #endif // LPN_OPS_H
