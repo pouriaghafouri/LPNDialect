@@ -1,10 +1,14 @@
-#ifndef LPNTYPES_H
-#define LPNTYPES_H
+#ifndef LPN_DIALECT_TYPES_H
+#define LPN_DIALECT_TYPES_H
 
-#include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/DialectImplementation.h"
+#include "mlir/IR/Types.h"
+
+namespace mlir {
+namespace lpn {
+} // namespace lpn
+} // namespace mlir
 
 #define GET_TYPEDEF_CLASSES
 #include "LPN/Dialect/LPNTypes.h.inc"
 
-#endif // LPNTYPES_H
+#endif // LPN_DIALECT_TYPES_H

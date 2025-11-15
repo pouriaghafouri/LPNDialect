@@ -1,23 +1,21 @@
-#ifndef LPN_TYPES
-#define LPN_TYPES
+#ifndef LPN_TYPES_TD
+#define LPN_TYPES_TD
 
-include "LPN/LPNDialect.td"
+include "mlir/IR/AttrTypeBase.td"
+include "LPNDialect.td"
 
-class LPN_Type<string name, string typeMnemonic> : TypeDef<LPN_Dialect, name> {
-  let mnemonic = typeMnemonic;
+// A handle to a Place or Transition node in an LPN graph.
+def NodeType : TypeDef<LPN_Dialect, "Node"> {
+  let summary = "Handle to a place or transition node in an LPN graph";
+
+  let description = [{
+    This is a simple opaque type used as the type of SSA values produced
+    by `lpn.place` and `lpn.transition` operations. Edges (`lpn.in_edge`
+    and `lpn.out_edge`) take this type as operands to connect nodes in
+    the Petri net graph.
+  }];
+
+  let mnemonic = "node";
 }
 
-def LPN_TokenType : LPN_Type<"Token", "token"> {
-  let parameters = (ins ArrayRefParameter<"StringAttr">:$properties);
-  // ... rest of definition
-}
-
-def LPN_PlaceType : LPN_Type<"Place", "place"> {
-  // ... definition
-}
-
-def LPN_TransitionType : LPN_Type<"Transition", "transition"> {
-  // ... definition
-}
-
-#endif // LPN_TYPES
+#endif // LPN_TYPES_TD

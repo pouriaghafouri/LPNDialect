@@ -1,45 +1,29 @@
-#ifndef LPN_ATTRIBUTES
-#define LPN_ATTRIBUTES
+#ifndef LPN_ATTRIBUTES_TD
+#define LPN_ATTRIBUTES_TD
 
-include "LPN/LPNDialect.td"
 include "mlir/IR/AttrTypeBase.td"
+include "mlir/IR/BuiltinAttributes.td"
+include "LPNDialect.td"
 
-def LPN_LatencyAttr : AttrDef<LPN_Dialect, "latency"> {
-  let summary = "Represents a transition latency";
+def TokenPropertyNamesParam : AttrParameter<"::llvm::ArrayRef<::llvm::StringRef>", "names of integer-valued token properties"> {
+  let allocator = "$_dst = $_allocator.copyInto($_self);";
+}
+
+def TokenPropertySetAttr : AttrDef<LPN_Dialect, "TokenPropertySet"> {
+  let summary = "schema of token properties stored in a place";
 
   let description = [{
-    A latency attribute represents the delay before a transition fires.
-    This can be a constant or symbolic (IntSymbol).
+    This attribute represents the logical "type" of tokens that can be
+    stored in a place. Each token is a dictionary mapping these property
+    names to integer values, plus an implicit integer timestamp.
   }];
 
-  let parameters = (ins "double":$value);
-  let assemblyFormat = "`<` $value `>`";
+  let mnemonic = "token_props";
+
+  let parameters = (ins TokenPropertyNamesParam:$properties);
 }
 
-def LPN_IntSymbolAttr : AttrDef<LPN_Dialect, "int_symbol"> {
-  let summary = "Represents a symbolic integer parameter";
-  let description = [{
-    Models symbolic integer values (similar to createIntSymbol in the Python LPN
-    framework). Each symbol has a unique string identifier, optional concrete
-    value, and optional bounds.
-  }];
-  let parameters = (ins
-    "StringRef":$sym,
-    "Optional<int>":$values,
-    "Optional<int>":$lowerBound,
-    "Optional<int>":$upperBound,
-    "Optional<int>":$id
-  );
+// Constraint so we can use it directly in ops (e.g. TokenPropertySet:$token_props).
+def TokenPropertySet : Attr<"::mlir::lpn::TokenPropertySetAttr">;
 
-  let assemblyFormat = [{
-    `<` $sym (`,` $value^)? (`,` $lowerBound^)? (`,` $upperBound^)? (`,` $id^)? `>`
-  }];
-}
-
-def LPN_StringAttr : AttrDef<LPN_Dialect, "string"> {
-  let summary = "Simple string attribute for identifiers or names";
-  let parameters = (ins "StringRef":$value);
-  let assemblyFormat = "`<` $value `>`";
-}
-
-#endif // LPN_ATTRIBUTES
+#endif // LPN_ATTRIBUTES_TD
