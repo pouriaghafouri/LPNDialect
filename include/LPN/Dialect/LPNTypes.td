@@ -4,18 +4,27 @@
 include "mlir/IR/AttrTypeBase.td"
 include "LPNDialect.td"
 
-// A handle to a Place or Transition node in an LPN graph.
-def NodeType : TypeDef<LPN_Dialect, "Node"> {
-  let summary = "Handle to a place or transition node in an LPN graph";
+def TokenType : TypeDef<LPN_Dialect, "Token"> {
+  let summary = "Opaque handle representing a token consumed/produced by schedules";
 
   let description = [{
-    This is a simple opaque type used as the type of SSA values produced
-    by `lpn.place` and `lpn.transition` operations. Edges (`lpn.in_edge`
-    and `lpn.out_edge`) take this type as operands to connect nodes in
-    the Petri net graph.
+    Tokens are abstract values that flow through schedule functions. They can
+    only be materialized by `lpn.take` and consumed by `lpn.emit` or the other
+    token-manipulation operations provided by this dialect.
   }];
 
-  let mnemonic = "node";
+  let mnemonic = "token";
+}
+
+def PlaceHandleType : TypeDef<LPN_Dialect, "Place"> {
+  let summary = "Handle to a place";
+
+  let description = [{
+    Represents a runtime reference to a place. Obtain handles via
+    `lpn.place_ref` or by indexing into place lists.
+  }];
+
+  let mnemonic = "place";
 }
 
 #endif // LPN_TYPES_TD
