@@ -4,6 +4,8 @@
 include "mlir/IR/OpBase.td"
 include "mlir/IR/BuiltinAttributes.td"
 include "mlir/IR/BuiltinTypes.td"
+include "mlir/IR/SymbolInterfaces.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 
 include "LPNDialect.td"
 include "LPNTypes.td"
@@ -11,153 +13,97 @@ include "LPNAttributes.td"
 
 class LPN_Op<string mnemonic, list<Trait> traits = []> : Op<LPN_Dialect, mnemonic, traits> {}
 
-def NetOp : LPN_Op<"net", [IsolatedFromAbove]> {
-  let summary = "Top-level container for a LPN";
-  let description = [{
-    `lpn.net` is a container operation that holds the whole LPN.
-    Its single region typically contains `lpn.place`,
-    `lpn.transition`, `lpn.in_edge` and `lpn.out_edge` operations
-    describing the graph structure.
-  }];
+def LPN_Token : Type<"::mlir::lpn::TokenType">;
 
-  let regions = (region AnyRegion:$body);
-
-  // Simple syntax: `lpn.net { ... }`
-  let assemblyFormat = "attr-dict-with-keyword $body";
-}
-
-def PlaceOp : LPN_Op<"place", [NoSideEffect]> {
-  let summary = "Create a place in a LPN";
+def CreateTokenOp : LPN_Op<"create_token", []> {
+  let summary = "Creates a new LPN token";
 
   let description = [{
-    Creates a place node and returns a handle of type `!lpn.node`
-    that can be used when creating edges.
+    Allocates a new token value of type !lpn.token.
 
-    - `name`           : human-readable identifier of the place.
-    - `capacity`       : maximum number of tokens stored (optional, -1 == unbounded).
-    - `initial_tokens` : number of tokens initially present (optional).
-    - `token_props`    : schema of token properties for this place (optional).
+    The timestamp is modeled as an i64 SSA value, not as part of the type.
+    This operation accepts an optional i64 operand:
 
-    Example:
-      %p = lpn.place "P_in"
-             { capacity = 16, initial_tokens = 1,
-               token_props = #lpn.token_props<["size", "prio"]> }
-           : !lpn.node
+      - If no operand is provided, the runtime may assume a default
+        timestamp (e.g. ts = 0).
+
+      - If an operand is provided, that value is used as the initial
+        timestamp of the token.
+
+    Example usage:
+      %t0 = lpn.create_token : !lpn.token
+      %ts = arith.constant 7 : i64
+      %t1 = lpn.create_token %ts : !lpn.token
   }];
 
   let arguments = (ins
-    StrAttr:$name,
-
-    // Optional integer capacity; if absent, interpreted as unbounded.
-    OptionalAttr<I64Attr>:$capacity,
-    OptionalAttr<I64Attr>:$initial_tokens,
-    OptionalAttr<TokenPropertySet>:$token_props
+    Optional<I64>:$timestamp
   );
 
   let results = (outs
-    NodeType:$handle
+    LPN_Token:$token
   );
 
-  let assemblyFormat = [{
-    $name (`capacity` $capacity^)? (`,`
-      `initial_tokens` $initial_tokens^)? (`,`
-      `token_props` $token_props^)? attr-dict
-      `:` type($handle)
-  }];
+  // Two textual forms:
+  //   lpn.create_token : !lpn.token
+  //   lpn.create_token %ts : !lpn.token
+  let assemblyFormat =
+    "($timestamp^)? attr-dict `:` type($token)";
 }
 
-def TransitionOp : LPN_Op<"transition", [NoSideEffect]> {
-  let summary = "Create a transition in a LPN";
+def GetTimestampOp : LPN_Op<"get_timestamp", [NoSideEffect]> {
+  let summary = "Reads the current timestamp associated with a token";
 
   let description = [{
-    Creates a transition node and returns a handle of type `!lpn.node`.
+    Extracts the timestamp associated with a token as an i64 SSA value.
 
-    - `name`      : human-readable identifier of the transition.
-    - `delay`     : constant latency (cycles) before firing (optional).
-                   More advanced delay functions can later be modelled
-                   by custom attributes referring to functions.
+    In the runtime model, this corresponds to reading tk.ts for the
+    underlying Token object.
+
+    Example usage:
+    %ts = lpn.get_timestamp %t1 : !lpn.token -> i64
   }];
 
   let arguments = (ins
-    StrAttr:$name,
-    OptionalAttr<I64Attr>:$delay
+    LPN_Token:$token
   );
 
   let results = (outs
-    NodeType:$handle
+    I64:$timestamp
   );
 
-  let assemblyFormat = [{
-    $name (`delay` $delay^)? attr-dict
-      `:` type($handle)
-  }];
+  let assemblyFormat =
+    "$token attr-dict `:` type($token) `->` type($timestamp)";
 }
 
-// (place -> transition)
-
-def InEdgeOp : LPN_Op<"in_edge", [NoSideEffect]> {
-  let summary = "Input edge from place to transition";
+def SetTimestampOp : LPN_Op<"set_timestamp", []> {
+  let summary = "Return a token with an updated timestamp";
 
   let description = [{
-    Models an input edge from a place to a transition.
+    Return a new token value that is identical to the input token,
+    except that its timestamp is updated to the given i64 value.
 
-    - `src`       : handle of the source place.
-    - `dst`       : handle of the destination transition.
-    - `weight`    : number of tokens consumed when the transition commits.
-    - `guard`     : (optional) textual guard condition on token properties.
-    - `threshold` : (optional) threshold used in the enable condition.
+    In SSA form, the original token value remains available; the
+    updated token is produced as a new result. In the runtime model,
+    this corresponds to updating tk.ts on the underlying Token object.
 
-    In the original Python library, weights/guards/thresholds are
-    functions over tokens; here we start with constants and simple
-    strings to keep the first dialect version easy to work with.
+    example usage:
+
+    %ts = arith.constant 42 : i64
+    %t2  = lpn.set_timestamp %t1, %ts : !lpn.token -> !lpn.token
   }];
 
   let arguments = (ins
-    NodeType:$src,
-    NodeType:$dst,
-
-    OptionalAttr<I64Attr>:$weight,
-    OptionalAttr<StrAttr>:$guard,
-    OptionalAttr<I64Attr>:$threshold
+    LPN_Token:$token,
+    I64:$new_timestamp
   );
 
-  let results = (outs);
-
-  let assemblyFormat = [{
-    $src `->` $dst
-      (`weight` $weight^)? (`,`
-       `guard` $guard^)? (`,`
-       `threshold` $threshold^)? attr-dict
-      `:` type($src) `,` type($dst)
-  }];
-}
-
-// (transition -> place)
-
-def OutEdgeOp : LPN_Op<"out_edge", [NoSideEffect]> {
-  let summary = "Output edge from transition to place";
-
-  let description = [{
-    Models an output edge from a transition to a place.
-
-    - `src`    : handle of the source transition.
-    - `dst`    : handle of the destination place.
-    - `weight` : number of tokens produced when the transition commits.
-  }];
-
-  let arguments = (ins
-    NodeType:$src,
-    NodeType:$dst,
-    OptionalAttr<I64Attr>:$weight
+  let results = (outs
+    LPN_Token:$updated
   );
 
-  let results = (outs);
-
-  let assemblyFormat = [{
-    $src `->` $dst
-      (`weight` $weight^)? attr-dict
-      `:` type($src) `,` type($dst)
-  }];
+  let assemblyFormat =
+    "$token `,` $new_timestamp attr-dict `:` type($token) `->` type($updated)";
 }
 
 #endif // LPN_OPS_TD
