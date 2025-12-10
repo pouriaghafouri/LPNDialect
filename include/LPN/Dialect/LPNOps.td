@@ -106,4 +106,68 @@ def SetTimestampOp : LPN_Op<"set_timestamp", []> {
     "$token `,` $new_timestamp attr-dict `:` type($token) `->` type($updated)";
 }
 
+def SetPropOp : LPN_Op<"set_prop", []> {
+  let summary = "Set a property on a token";
+
+  let description = [{
+    Stores a property value in the token's runtime dictionary.
+
+    Semantics (Python-style):
+      token.props[name] = value
+
+    This returns a new token SSA value (SSA is immutable). The
+    runtime is free to clone or mutate the underlying object,
+    but it must associate the new SSA value with the updated
+    dictionary state.
+
+    Example:
+      %c20 = arith.constant 20 : i64
+      %t1  = lpn.set_prop %t0, "size", %c20
+              : !lpn.token -> !lpn.token
+  }];
+
+  let arguments = (ins
+    LPN_Token:$token,
+    StrAttr:$name,
+    I64:$value
+  );
+
+  let results = (outs
+    LPN_Token:$updated
+  );
+
+  let assemblyFormat =
+    "$token `,` $name `,` $value attr-dict "
+    "`:` type($token) `->` type($updated)";
+}
+
+def GetPropOp : LPN_Op<"get_prop", [NoSideEffect]> {
+  let summary = "Get a property from a token's dictionary";
+
+  let description = [{
+    Reads a property from the token's runtime dictionary.
+
+    Semantics (Python-style):
+      value = token.props[name]
+
+    Example:
+      %size = lpn.get_prop %t1, "size"
+              : !lpn.token -> i64
+  }];
+
+  let arguments = (ins
+    LPN_Token:$token,
+    StrAttr:$name
+  );
+
+  let results = (outs
+    I64:$value
+  );
+
+  let assemblyFormat =
+    "$token `,` $name attr-dict "
+    "`:` type($token) `->` type($value)";
+}
+
+
 #endif // LPN_OPS_TD
