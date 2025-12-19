@@ -213,7 +213,6 @@ struct EdgeTemplate {
   TargetInfo target;
   Value takeValue;
   Value tokenValue;
-  Value placeValue;
   Value delayValue;
   SmallVector<ControlContext> contexts;
   SmallVector<TokenEditSignature> editSummary;
@@ -273,6 +272,32 @@ static void dedupPaths(
         unique.push_back(path);
     }
     entry.second.swap(unique);
+  }
+}
+
+static void collectTakeDependencies(Value value,
+                                    SmallPtrSetImpl<Value> &takes) {
+  if (!value)
+    return;
+  SmallVector<Value, 8> stack;
+  stack.push_back(value);
+  SmallPtrSet<Value, 16> visited;
+  while (!stack.empty()) {
+    Value current = stack.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    if (auto res = dyn_cast<OpResult>(current)) {
+      Operation *def = res.getDefiningOp();
+      if (!def)
+        continue;
+      if (auto take = dyn_cast<TakeOp>(def)) {
+        takes.insert(take.getResult());
+        continue;
+      }
+      for (Value operand : def->getOperands())
+        stack.push_back(operand);
+      continue;
+    }
   }
 }
 
@@ -485,9 +510,14 @@ static Value cloneValueInto(Value value, IRMapping &mapping,
   Operation *def = value.getDefiningOp();
   if (!def)
     return {};
-  if (isa<TakeOp>(def)) {
-    def->emitError("token flow depends on additional lpn.take op");
-    return {};
+  if (auto take = dyn_cast<TakeOp>(def)) {
+    for (Value operand : take->getOperands())
+      if (!cloneValueInto(operand, mapping, builder))
+        return {};
+    Operation *clone = builder.clone(*take, mapping);
+    Value result = clone->getResult(0);
+    mapping.map(value, result);
+    return result;
   }
 
   for (Value operand : def->getOperands())
@@ -515,25 +545,6 @@ static Value buildGuardCondition(const SmallVectorImpl<TokenGuard> &guards,
     condition = condition ? builder.create<arith::AndIOp>(condition, eq) : eq;
   }
   return condition;
-}
-
-static bool conditionUsesForeignTakes(Value value, Value allowedToken,
-                                      SmallPtrSetImpl<Value> &visited) {
-  if (!visited.insert(value).second)
-    return false;
-  if (value == allowedToken)
-    return false;
-  if (auto arg = dyn_cast<BlockArgument>(value))
-    return true;
-  Operation *def = value.getDefiningOp();
-  if (!def)
-    return true;
-  if (auto take = dyn_cast<TakeOp>(def))
-    return take.getResult() != allowedToken;
-  for (Value operand : def->getOperands())
-    if (conditionUsesForeignTakes(operand, allowedToken, visited))
-      return true;
-  return false;
 }
 
 /// Helper to ensure a valid accumulated delay value exists.
@@ -570,20 +581,25 @@ struct LPNRetainObservablesPass
 
   LogicalResult processNet(NetOp net) {
     SmallVector<PlaceOp> observablePlaces;
+    DenseSet<StringAttr> observableNames;
     for (PlaceOp place : net.getOps<PlaceOp>())
-      if (place.getObservableAttr())
+      if (place.getObservableAttr()) {
         observablePlaces.push_back(place);
+        observableNames.insert(place.getSymNameAttr());
+      }
     if (observablePlaces.size() < 2)
       return success();
 
     SmallVector<std::unique_ptr<EdgeTemplate>> templates;
     DenseMap<StringAttr, SmallVector<const EdgeTemplate *>> adjacency;
+    DenseMap<Value, StringAttr> takePlaces;
     for (TransitionOp trans : net.getOps<TransitionOp>()) {
       for (TakeOp take :
            llvm::make_early_inc_range(trans.getBody().getOps<TakeOp>())) {
         StringAttr source;
         if (failed(resolvePlaceSymbol(take.getPlace(), source)))
           continue;
+        takePlaces[take.getResult()] = source;
         SmallVector<std::pair<EmitOp, Value>> flows;
         SmallPtrSet<Value, 8> visited;
         if (failed(collectTokenFlows(take.getResult(), flows, visited)))
@@ -596,17 +612,35 @@ struct LPNRetainObservablesPass
           Operation *parent = emit.getOperation()->getParentOp();
           while (parent && parent != trans) {
             if (auto ifOp = dyn_cast<scf::IfOp>(parent)) {
-              SmallPtrSet<Value, 4> seen;
-              if (!conditionUsesForeignTakes(ifOp.getCondition(),
-                                              take.getResult(), seen)) {
-                bool inThen =
-                    emit->getBlock()->getParent() == &ifOp.getThenRegion();
-                contexts.push_back({ifOp.getOperation(), inThen});
-              }
+              bool inThen =
+                  emit->getBlock()->getParent() == &ifOp.getThenRegion();
+              contexts.push_back({ifOp.getOperation(), inThen});
             }
             parent = parent->getParentOp();
           }
           std::reverse(contexts.begin(), contexts.end());
+
+          SmallPtrSet<Value, 8> requiredTakes;
+          requiredTakes.insert(take.getResult());
+          collectTakeDependencies(tokenVal, requiredTakes);
+          collectTakeDependencies(emit.getPlace(), requiredTakes);
+          collectTakeDependencies(emit.getDelay(), requiredTakes);
+          for (const ControlContext &ctx : contexts)
+            if (auto ifOp = dyn_cast<scf::IfOp>(ctx.op))
+              collectTakeDependencies(ifOp.getCondition(), requiredTakes);
+
+          bool usesHiddenTake = false;
+          for (Value dep : requiredTakes) {
+            auto it = takePlaces.find(dep);
+            if (it == takePlaces.end())
+              continue;
+            if (!observableNames.contains(it->second)) {
+              usesHiddenTake = true;
+              break;
+            }
+          }
+          if (usesHiddenTake)
+            continue;
 
           for (TargetInfo &target : targets) {
             SmallVector<TokenEditSignature> editSummary;
@@ -616,8 +650,7 @@ struct LPNRetainObservablesPass
               continue;
             auto templ = std::make_unique<EdgeTemplate>(
                 EdgeTemplate{source, target, take.getResult(), tokenVal,
-                             emit.getPlace(), emit.getDelay(), contexts,
-                             editSummary});
+                             emit.getDelay(), contexts, editSummary});
             const EdgeTemplate *ptr = templ.get();
             adjacency[source].push_back(ptr);
             templates.push_back(std::move(templ));
@@ -628,10 +661,6 @@ struct LPNRetainObservablesPass
 
     if (adjacency.empty())
       return success();
-
-    DenseSet<StringAttr> observableNames;
-    for (PlaceOp place : observablePlaces)
-      observableNames.insert(place.getSymNameAttr());
 
     DenseMap<StringAttr, SmallVector<EdgePath>> observablePaths;
     for (PlaceOp place : observablePlaces) {
@@ -838,11 +867,7 @@ struct LPNRetainObservablesPass
       dedupReady.push_back(cursor);
     }
 
-    for (const PathCursor &cursor : dedupReady) {
-      if (failed(emitLeaf(cursor, token, accumulatedDelay, builder)))
-        return failure();
-    }
-    return success();
+    return emitLeafChoices(dedupReady, token, accumulatedDelay, builder);
   }
 
   LogicalResult emitLeaf(const PathCursor &cursor, Value token,
@@ -867,9 +892,9 @@ struct LPNRetainObservablesPass
           inner.create<arith::AddFOp>(totalDelay, stepDelay).getResult();
       bool last = (cursor.edgeIndex + 1 == cursor.path->size());
       if (last) {
-        Value place = cloneValueInto(templ->placeValue, mapping, inner);
-        if (!place)
-          return failure();
+        auto placeType = PlaceType::get(inner.getContext());
+        auto placeAttr = FlatSymbolRefAttr::get(templ->target.symbol);
+        Value place = inner.create<PlaceRefOp>(placeType, placeAttr);
         inner.create<EmitOp>(place, newToken, totalDelay);
         return success();
       }
@@ -895,6 +920,35 @@ struct LPNRetainObservablesPass
       return failure();
     inner.create<scf::YieldOp>();
     builder.setInsertionPointAfter(guardIf);
+    return success();
+  }
+
+  LogicalResult emitLeafChoices(ArrayRef<PathCursor> cursors, Value token,
+                                Value accumulatedDelay,
+                                ImplicitLocOpBuilder &builder) const {
+    if (cursors.empty())
+      return success();
+    if (cursors.size() == 1)
+      return emitLeaf(cursors.front(), token, accumulatedDelay, builder);
+    auto choice = builder.create<ChoiceOp>();
+    auto populate = [&](Region &region,
+                        ArrayRef<PathCursor> subset) -> LogicalResult {
+      region.getBlocks().clear();
+      Block &block = region.emplaceBlock();
+      ImplicitLocOpBuilder branchBuilder(builder.getLoc(),
+                                         builder.getContext());
+      branchBuilder.setInsertionPointToStart(&block);
+      if (failed(
+              emitLeafChoices(subset, token, accumulatedDelay, branchBuilder)))
+        return failure();
+      branchBuilder.create<ChoiceYieldOp>();
+      return success();
+    };
+    if (failed(populate(choice.getThenRegion(), cursors.take_front(1))))
+      return failure();
+    if (failed(populate(choice.getElseRegion(), cursors.drop_front())))
+      return failure();
+    builder.setInsertionPointAfter(choice);
     return success();
   }
 
