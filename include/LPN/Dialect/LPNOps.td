@@ -4,6 +4,7 @@
 include "mlir/IR/OpBase.td"
 include "mlir/IR/BuiltinAttributes.td"
 include "mlir/IR/BuiltinTypes.td"
+include "mlir/IR/CommonAttrConstraints.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
@@ -13,151 +14,263 @@ include "LPNAttributes.td"
 
 class LPN_Op<string mnemonic, list<Trait> traits = []> : Op<LPN_Dialect, mnemonic, traits> {}
 
-def LPN_Token : Type<"::mlir::lpn::TokenType">;
+//===----------------------------------------------------------------------===//
+// Structural operations
+//===----------------------------------------------------------------------===//
 
-def CreateTokenOp : LPN_Op<"create_token", []> {
-  let summary = "Creates a new LPN token";
+def NetOp : LPN_Op<"net", [
+    SymbolTable,
+    SingleBlockImplicitTerminator<"mlir::lpn::HaltOp">,
+    IsolatedFromAbove
+  ]> {
+  let summary = "Root container for an LPN network";
 
   let description = [{
-    Allocates a new token value of type !lpn.token.
+    Encapsulates a scheduler-driven Petri net. The region holds `lpn.place`
+    declarations followed by `lpn.transition` definitions and a final
+    `lpn.halt`. The op establishes a local symbol table so that nested
+    operations may refer to places and transitions by name.
+  }];
 
-    The timestamp is modeled as an i64 SSA value, not as part of the type.
-    This operation accepts an optional i64 operand:
+  let regions = (region AnyRegion:$body);
 
-      - If no operand is provided, the runtime may assume a default
-        timestamp (e.g. ts = 0).
+  let assemblyFormat = "attr-dict-with-keyword $body";
+}
 
-      - If an operand is provided, that value is used as the initial
-        timestamp of the token.
+def PlaceOp : LPN_Op<"place", [Symbol]> {
+  let summary = "Declare a place";
 
-    Example usage:
-      %t0 = lpn.create_token : !lpn.token
-      %ts = arith.constant 7 : i64
-      %t1 = lpn.create_token %ts : !lpn.token
+  let description = [{
+    Declares a place within an `lpn.net`. Places may optionally specify a
+    capacity and/or initial token count.  When the optional `observable`
+    attribute is present the place marks an external interface point that must
+    be preserved by downstream reduction passes.
   }];
 
   let arguments = (ins
-    Optional<I64>:$timestamp
+    SymbolNameAttr:$sym_name,
+    OptionalAttr<I64Attr>:$capacity,
+    OptionalAttr<I64Attr>:$initial_tokens,
+    OptionalAttr<UnitAttr>:$observable
+  );
+
+  let assemblyFormat = "$sym_name attr-dict";
+}
+
+def HaltOp : LPN_Op<"halt", [Terminator]> {
+  let summary = "Terminate an `lpn.net` body";
+  let assemblyFormat = "attr-dict";
+}
+
+def TransitionOp : LPN_Op<"transition", [
+    Symbol,
+    IsolatedFromAbove,
+    SingleBlockImplicitTerminator<"mlir::lpn::ScheduleReturnOp">
+  ]> {
+  let summary = "Define a scheduler body";
+
+  let description = [{
+    Models a scheduler (transition) responsible for manipulating tokens across
+    places. The transition body is a single-block region terminated with
+    `lpn.schedule.return`.
+  }];
+
+  let arguments = (ins
+    SymbolNameAttr:$sym_name
+  );
+  let regions = (region AnyRegion:$body);
+
+  let assemblyFormat = "$sym_name attr-dict-with-keyword $body";
+}
+
+def ScheduleReturnOp : LPN_Op<"schedule.return", [Terminator]> {
+  let summary = "Return from a transition region";
+  let assemblyFormat = "attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// Place handle utilities
+//===----------------------------------------------------------------------===//
+
+def PlaceRefOp : LPN_Op<"place_ref", [Pure]> {
+  let summary = "Materialize a place handle";
+
+  let arguments = (ins
+    FlatSymbolRefAttr:$place
   );
 
   let results = (outs
-    LPN_Token:$token
+    PlaceHandleType:$handle
   );
 
-  // Two textual forms:
-  //   lpn.create_token : !lpn.token
-  //   lpn.create_token %ts : !lpn.token
   let assemblyFormat =
-    "($timestamp^)? attr-dict `:` type($token)";
+    "$place attr-dict `:` type($handle)";
 }
 
-def GetTimestampOp : LPN_Op<"get_timestamp", [NoSideEffect]> {
-  let summary = "Reads the current timestamp associated with a token";
-
-  let description = [{
-    Extracts the timestamp associated with a token as an i64 SSA value.
-
-    In the runtime model, this corresponds to reading tk.ts for the
-    underlying Token object.
-
-    Example usage:
-    %ts = lpn.get_timestamp %t1 : !lpn.token -> i64
-  }];
+def PlaceListOp : LPN_Op<"place_list", [Pure]> {
+  let summary = "Create a list of place handles";
 
   let arguments = (ins
-    LPN_Token:$token
+    FlatSymbolRefArrayAttr:$places
   );
 
   let results = (outs
-    I64:$timestamp
+    PlaceListType:$list
   );
 
   let assemblyFormat =
-    "$token attr-dict `:` type($token) `->` type($timestamp)";
+    "attr-dict `:` type($list)";
 }
 
-def SetTimestampOp : LPN_Op<"set_timestamp", []> {
-  let summary = "Return a token with an updated timestamp";
-
-  let description = [{
-    Return a new token value that is identical to the input token,
-    except that its timestamp is updated to the given i64 value.
-
-    In SSA form, the original token value remains available; the
-    updated token is produced as a new result. In the runtime model,
-    this corresponds to updating tk.ts on the underlying Token object.
-
-    example usage:
-
-    %ts = arith.constant 42 : i64
-    %t2  = lpn.set_timestamp %t1, %ts : !lpn.token -> !lpn.token
-  }];
+def PlaceListGetOp : LPN_Op<"place_list.get", [Pure]> {
+  let summary = "Read a handle from a place list";
 
   let arguments = (ins
-    LPN_Token:$token,
-    I64:$new_timestamp
+    PlaceListType:$list,
+    Index:$index
   );
 
   let results = (outs
-    LPN_Token:$updated
+    PlaceHandleType:$handle
   );
 
   let assemblyFormat =
-    "$token `,` $new_timestamp attr-dict `:` type($token) `->` type($updated)";
+    "$list `,` $index attr-dict `:` `(` type($list) `,` type($index) `)` `->` type($handle)";
 }
 
-def SetPropOp : LPN_Op<"set_prop", []> {
-  let summary = "Set a property on a token";
+//===----------------------------------------------------------------------===//
+// Token flow primitives
+//===----------------------------------------------------------------------===//
+
+def TakeOp : LPN_Op<"take"> {
+  let summary = "Remove a token from a place";
+
+  let arguments = (ins
+    PlaceHandleType:$place
+  );
+
+  let results = (outs
+    TokenType:$token
+  );
+
+  let assemblyFormat =
+    "$place attr-dict `:` type($place) `->` type($token)";
+}
+
+def EmitOp : LPN_Op<"emit"> {
+  let summary = "Schedule a token into a place after a delay";
+
+  let arguments = (ins
+    PlaceHandleType:$place,
+    TokenType:$token,
+    F64:$delay
+  );
+
+  let assemblyFormat =
+    "$place `,` $token `,` $delay attr-dict `:` type($place) `,` type($token) `,` type($delay)";
+}
+
+def CountOp : LPN_Op<"count", [Pure]> {
+  let summary = "Read the current occupancy of a place";
+
+  let arguments = (ins
+    PlaceHandleType:$place
+  );
+
+  let results = (outs
+    I64:$count
+  );
+
+  let assemblyFormat =
+    "$place attr-dict `:` type($place) `->` type($count)";
+}
+
+//===----------------------------------------------------------------------===//
+// Token utilities
+//===----------------------------------------------------------------------===//
+
+def TokenCreateOp : LPN_Op<"token.create", [Pure]> {
+  let summary = "Create a token with an optional literal property log";
 
   let description = [{
-    Stores a property value in the token's runtime dictionary.
-
-    Semantics (Python-style):
-      token.props[name] = value
-
-    This returns a new token SSA value (SSA is immutable). The
-    runtime is free to clone or mutate the underlying object,
-    but it must associate the new SSA value with the updated
-    dictionary state.
-
-    Example:
-      %c20 = arith.constant 20 : i64
-      %t1  = lpn.set_prop %t0, "size", %c20
-              : !lpn.token -> !lpn.token
+    Allocate a fresh token handle of type `!lpn.token`.  Tokens are modeled as
+    append-only logs of `(key, value)` pairs.  The optional `log_prefix`
+    attribute allows the IR to materialize a compile-time log prefix (each
+    dictionary entry is appended in attribute iteration order).  If omitted, the
+    token starts with an empty log.
   }];
 
   let arguments = (ins
-    LPN_Token:$token,
-    StrAttr:$name,
+    OptionalAttr<DictionaryAttr>:$log_prefix
+  );
+
+  let results = (outs
+    TokenType:$token
+  );
+
+  let assemblyFormat =
+    "($log_prefix^)? attr-dict `:` type($token)";
+}
+
+def TokenCloneOp : LPN_Op<"token.clone", [Pure]> {
+  let summary = "Duplicate a token handle";
+
+  let description = [{
+    Produce a second SSA value that references the same runtime token.  Since
+    updates are modeled as new log entries (not destructive mutation), cloning
+    is a trivial, side-effect-free operation.
+  }];
+
+  let arguments = (ins
+    TokenType:$token
+  );
+
+  let results = (outs
+    TokenType:$copy
+  );
+
+  let assemblyFormat =
+    "$token attr-dict `:` type($token) `->` type($copy)";
+}
+
+def TokenSetOp : LPN_Op<"token.set", [Pure]> {
+  let summary = "Append a `(key, value)` entry to a token log";
+
+  let description = [{
+    Append a new `(key, value)` tuple to the token's log and return the updated
+    token SSA value.  If the same key appears multiple times, the most recent
+    entry is the one observed by `token.get`.  This models the semantic history
+    needed for later transition-merging passes without resorting to mutable
+    dictionaries.
+  }];
+
+  let arguments = (ins
+    TokenType:$token,
+    StrAttr:$field,
     I64:$value
   );
 
   let results = (outs
-    LPN_Token:$updated
+    TokenType:$updated
   );
 
   let assemblyFormat =
-    "$token `,` $name `,` $value attr-dict "
-    "`:` type($token) `->` type($updated)";
+    "$token `,` $field `,` $value attr-dict `:` type($token) `->` type($updated)";
 }
 
-def GetPropOp : LPN_Op<"get_prop", [NoSideEffect]> {
-  let summary = "Get a property from a token's dictionary";
+def TokenGetOp : LPN_Op<"token.get", [Pure]> {
+  let summary = "Read the latest value for a key from a token log";
 
   let description = [{
-    Reads a property from the token's runtime dictionary.
-
-    Semantics (Python-style):
-      value = token.props[name]
-
-    Example:
-      %size = lpn.get_prop %t1, "size"
-              : !lpn.token -> i64
+    Inspect the token's append-only log and return the value from the most
+    recent entry whose key matches `field`.  If the key was never set, the
+    runtime is allowed to return zero (mirroring the legacy simulator's
+    behavior).
   }];
 
   let arguments = (ins
-    LPN_Token:$token,
-    StrAttr:$name
+    TokenType:$token,
+    StrAttr:$field
   );
 
   let results = (outs
@@ -165,9 +278,34 @@ def GetPropOp : LPN_Op<"get_prop", [NoSideEffect]> {
   );
 
   let assemblyFormat =
-    "$token `,` $name attr-dict "
-    "`:` type($token) `->` type($value)";
+    "$token `,` $field attr-dict `:` type($token) `->` type($value)";
 }
 
+//===----------------------------------------------------------------------===//
+// Control abstractions
+//===----------------------------------------------------------------------===//
+
+def ChoiceYieldOp : LPN_Op<"choice.yield", [Terminator]> {
+  let summary = "Terminate a branch of lpn.choice";
+  let assemblyFormat = "attr-dict";
+}
+
+def ChoiceOp : LPN_Op<"choice", [
+    SingleBlockImplicitTerminator<"mlir::lpn::ChoiceYieldOp">
+  ]> {
+  let summary = "Abstract nondeterministic branch driven by hidden state";
+
+  let description = [{
+    Represents a branch whose predicate depends on state that has been dropped
+    from the observable view of the net. Each region models one possible
+    execution path; downstream passes may refine or discard the non-determinism
+    once more information becomes available.
+  }];
+
+  let regions = (region AnyRegion:$thenRegion,
+                 SizedRegion<1>:$elseRegion);
+
+  let assemblyFormat = "attr-dict-with-keyword $thenRegion $elseRegion";
+}
 
 #endif // LPN_OPS_TD

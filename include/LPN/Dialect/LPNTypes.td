@@ -27,4 +27,16 @@ def PlaceHandleType : TypeDef<LPN_Dialect, "Place"> {
   let mnemonic = "place";
 }
 
+def PlaceListType : TypeDef<LPN_Dialect, "PlaceList"> {
+  let summary = "Opaque list of place handles";
+
+  let description = [{
+    Represents a compile-time list of place references that can be indexed at
+    runtime (e.g., a switch egress array). Values of this type are created via
+    `lpn.place_list`.
+  }];
+
+  let mnemonic = "place_list";
+}
+
 #endif // LPN_TYPES_TD

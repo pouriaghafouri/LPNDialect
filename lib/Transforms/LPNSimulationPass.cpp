@@ -1,5 +1,6 @@
-#include "LPN/LPNDialect.h"
-#include "LPN/LPNPasses.h"
+#include "LPN/Dialect/LPNDialect.h"
+#include "LPN/Conversion/LPNPasses.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir {
