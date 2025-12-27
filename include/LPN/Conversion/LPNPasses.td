@@ -31,6 +31,16 @@ def LPNStripHiddenValuesPass : Pass<"lpn-strip-hidden-values", "ModuleOp"> {
   let constructor = "mlir::lpn::createLPNStripHiddenValuesPass()";
 }
 
+def LPNSynthesizeGuardPass : Pass<"lpn-synthesize-guards", "ModuleOp"> {
+  let summary = "Synthesize per-transition guard information.";
+  let constructor = "mlir::lpn::createLPNSynthesizeGuardPass()";
+}
+
+def LPNLinkTokenCreatesPass : Pass<"lpn-link-token-creates", "ModuleOp"> {
+  let summary = "Thread observable token dependencies through lpn.token.create.";
+  let constructor = "mlir::lpn::createLPNLinkTokenCreatesPass()";
+}
+
 def LPNRetainObservablesPass : Pass<"lpn-retain-observables", "ModuleOp"> {
   let summary = "Collapse networks to the user-marked observable places";
   let constructor = "mlir::lpn::createLPNRetainObservablesPass()";

@@ -201,6 +201,7 @@ def TokenCreateOp : LPN_Op<"token.create", [Pure]> {
   }];
 
   let arguments = (ins
+    Variadic<TokenType>:$deps,
     OptionalAttr<DictionaryAttr>:$log_prefix
   );
 
@@ -209,7 +210,7 @@ def TokenCreateOp : LPN_Op<"token.create", [Pure]> {
   );
 
   let assemblyFormat =
-    "($log_prefix^)? attr-dict `:` type($token)";
+    "($deps^ `:` type($deps))? ($log_prefix^)? attr-dict `:` type($token)";
 }
 
 def TokenCloneOp : LPN_Op<"token.clone", [Pure]> {

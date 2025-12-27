@@ -8,6 +8,15 @@
 #       -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build
 PYTHONPATH=. python3 examples/cache_net.py > /tmp/cache_net.mlir
-./build/tools/lpn-opt/lpn-opt --lpn-normalize-delays --lpn-abstract-hidden-state  --lpn-strip-hidden-values \
---lpn-retain-hypergraph --lpn-resolve-choices --lpn-dataflow-simplify  \
- --canonicalize --cse /tmp/cache_net.mlir > /tmp/cache_after_pass.mlir
+
+./build/tools/lpn-opt/lpn-opt --mlir-print-ir-after-all --lpn-synthesize-guards \
+  --lpn-normalize-delays \
+  --lpn-retain-hypergraph --lpn-strip-hidden-values \
+  --lpn-resolve-choices --canonicalize --cse \
+  --lpn-dataflow-simplify /tmp/cache_net.mlir > /tmp/cache_after_pass.mlir 2> /tmp/cache_pass_debug.log
+
+PYTHONPATH=. python3 examples/split_merge_net.py > /tmp/split_merge.mlir
+./build/tools/lpn-opt/lpn-opt --lpn-synthesize-guards --lpn-normalize-delays \
+  --lpn-retain-hypergraph --lpn-strip-hidden-values \
+  --lpn-resolve-choices --canonicalize --cse \
+  --lpn-dataflow-simplify /tmp/split_merge.mlir > /tmp/split_merge_after.mlir

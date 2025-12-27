@@ -25,6 +25,9 @@
 namespace mlir::lpn {
 namespace {
 
+static constexpr StringLiteral kGuardIdAttr = "lpn.guard_id";
+static constexpr StringLiteral kGuardPathsAttr = "lpn.guard_paths";
+
 //===----------------------------------------------------------------------===//
 // Pass overview
 //===----------------------------------------------------------------------===//
@@ -313,32 +316,6 @@ static void clusterHyperedges(
 }
 
 // collect all the take dependencies for a value, by going backwards one-by-one through the operations
-static void collectTakeDependencies(Value value,
-                                    SmallPtrSetImpl<Value> &takes) {
-  if (!value)
-    return;
-  SmallVector<Value, 8> stack;
-  stack.push_back(value);
-  SmallPtrSet<Value, 16> visited;
-  while (!stack.empty()) {
-    Value current = stack.pop_back_val();
-    if (!visited.insert(current).second)
-      continue;
-    if (auto res = dyn_cast<OpResult>(current)) {
-      Operation *def = res.getDefiningOp();
-      if (!def)
-        continue;
-      if (auto take = dyn_cast<TakeOp>(def)) {
-        takes.insert(take.getResult());
-        continue;
-      }
-      for (Value operand : def->getOperands())
-        stack.push_back(operand);
-      continue;
-    }
-  }
-}
-
 //===----------------------------------------------------------------------===//
 // Utility helpers
 //===----------------------------------------------------------------------===//
@@ -399,7 +376,7 @@ static llvm::hash_code hashOptionalValue(Value value,
 static LogicalResult summarizeTokenEdits(
     Value current, Value source, SmallVectorImpl<TokenEditSignature> &edits,
     DenseMap<Value, llvm::hash_code> &hashCache,
-    const SmallVector<ObservableSource> &sources) {
+    ArrayRef<ObservableSource> sources) {
   if (current == source)
     return success();
   Operation *def = current.getDefiningOp();
@@ -701,23 +678,29 @@ struct LPNRetainHypergraphPass
     SmallVector<std::unique_ptr<EdgeTemplate>> templates;
     DenseMap<StringAttr, SmallVector<const EdgeTemplate *>> adjacency;
     DenseMap<Value, StringAttr> takePlaces;
-    DenseSet<Value> hiddenTakeResults;
+    DenseMap<Value, unsigned> takeGuardIds;
+    DenseMap<unsigned, ObservableSource> guardIdSources;
     for (TransitionOp trans : net.getOps<TransitionOp>()) {
       SmallVector<TakeOp, 8> takes;
       for (TakeOp take : trans.getBody().getOps<TakeOp>())
         takes.push_back(take);
+      SmallVector<ObservableSource> transitionSources;
       for (TakeOp take : takes) {
         StringAttr place;
         if (failed(resolvePlaceSymbol(take.getPlace(), place)))
           continue;
-        if (observableNames.contains(place))
-          takePlaces[take.getResult()] = place;
-        else
-          hiddenTakeResults.insert(take.getResult());
+        takePlaces[take.getResult()] = place;
+        transitionSources.push_back({place, take.getResult()});
+        if (auto guardAttr =
+                take->getAttrOfType<IntegerAttr>(kGuardIdAttr)) {
+          unsigned guardId = guardAttr.getInt();
+          takeGuardIds[take.getResult()] = guardId;
+          guardIdSources[guardId] = {place, take.getResult()};
+        }
       }
       for (TakeOp take : takes) {
-        StringAttr source = takePlaces.lookup(take.getResult());
-        if (!source)
+        StringAttr driverPlace = takePlaces.lookup(take.getResult());
+        if (!driverPlace)
           continue;
         SmallVector<std::pair<EmitOp, Value>> flows;
         SmallPtrSet<Value, 8> visited;
@@ -764,47 +747,102 @@ struct LPNRetainHypergraphPass
           }
           std::reverse(contexts.begin(), contexts.end());
 
-          SmallPtrSet<Value, 8> requiredTakes;
-          requiredTakes.insert(take.getResult());
-          collectTakeDependencies(tokenVal, requiredTakes);
-          collectTakeDependencies(emit.getPlace(), requiredTakes);
-          collectTakeDependencies(emit.getDelay(), requiredTakes);
-          for (const ControlContext &ctx : contexts) {
-            if (ctx.kind == ContextKind::IfOp) {
-              if (auto ifOp = dyn_cast<scf::IfOp>(ctx.op))
-                collectTakeDependencies(ifOp.getCondition(), requiredTakes);
-              continue;
-            }
-            if (ctx.kind == ContextKind::ForOp) {
-              auto forOp = dyn_cast<scf::ForOp>(ctx.op);
-              collectTakeDependencies(forOp.getLowerBound(), requiredTakes);
-              collectTakeDependencies(forOp.getUpperBound(), requiredTakes);
-              collectTakeDependencies(forOp.getStep(), requiredTakes);
+          SmallVector<SmallVector<ObservableSource, 4>, 4> candidateSources;
+          bool usedGuardMetadata = false;
+          if (auto guardAttr =
+                  emit->getAttrOfType<ArrayAttr>(kGuardPathsAttr)) {
+            auto guardIt = takeGuardIds.find(take.getResult());
+            if (guardIt != takeGuardIds.end()) {
+              unsigned driverGuardId = guardIt->second;
+              for (Attribute attr : guardAttr) {
+                auto pathAttr = dyn_cast<ArrayAttr>(attr);
+                if (!pathAttr)
+                  continue;
+                SmallVector<unsigned, 4> guardIds;
+                guardIds.reserve(pathAttr.size());
+                bool containsDriver = false;
+                for (Attribute elem : pathAttr) {
+                  auto intAttr = dyn_cast<IntegerAttr>(elem);
+                  if (!intAttr)
+                    continue;
+                  unsigned guardId = intAttr.getInt();
+                  guardIds.push_back(guardId);
+                  if (guardId == driverGuardId)
+                    containsDriver = true;
+                }
+                if (!containsDriver)
+                  continue;
+                llvm::sort(guardIds);
+                guardIds.erase(
+                    std::unique(guardIds.begin(), guardIds.end()),
+                    guardIds.end());
+                SmallVector<ObservableSource, 4> pathSources;
+                for (unsigned guardId : guardIds) {
+                  auto srcIt = guardIdSources.find(guardId);
+                  if (srcIt == guardIdSources.end())
+                    continue;
+                  pathSources.push_back(srcIt->second);
+                }
+                if (pathSources.empty())
+                  continue;
+                auto driverIt = llvm::find_if(
+                    pathSources, [&](const ObservableSource &src) {
+                      return src.takeValue == take.getResult();
+                    });
+                if (driverIt == pathSources.end())
+                  continue;
+                std::swap(pathSources.front(), *driverIt);
+                if (pathSources.size() > 1)
+                  llvm::sort(pathSources.begin() + 1, pathSources.end(),
+                             [](const ObservableSource &a,
+                                const ObservableSource &b) {
+                               if (a.place != b.place)
+                                 return a.place.getValue() <
+                                        b.place.getValue();
+                               return a.takeValue.getAsOpaquePointer() <
+                                      b.takeValue.getAsOpaquePointer();
+                             });
+                candidateSources.push_back(std::move(pathSources));
+              }
+              if (!candidateSources.empty())
+                usedGuardMetadata = true;
             }
           }
-
-          SmallVector<ObservableSource> sources;
-          for (Value dep : requiredTakes) {
-            auto it = takePlaces.find(dep);
-            if (it == takePlaces.end())
+          if (!usedGuardMetadata) {
+            if (transitionSources.empty())
               continue;
-            sources.push_back(ObservableSource{it->second, dep});
+            SmallVector<ObservableSource, 4> fallbackSources(
+                transitionSources.begin(), transitionSources.end());
+            auto driverIt = llvm::find_if(
+                fallbackSources, [&](const ObservableSource &src) {
+                  return src.takeValue == take.getResult();
+                });
+            if (driverIt == fallbackSources.end())
+              continue;
+            std::swap(fallbackSources.front(), *driverIt);
+            if (fallbackSources.size() > 1)
+              llvm::sort(fallbackSources.begin() + 1,
+                         fallbackSources.end(),
+                         [](const ObservableSource &a,
+                            const ObservableSource &b) {
+                           if (a.place != b.place)
+                             return a.place.getValue() <
+                                    b.place.getValue();
+                           return a.takeValue.getAsOpaquePointer() <
+                                  b.takeValue.getAsOpaquePointer();
+                         });
+            candidateSources.push_back(std::move(fallbackSources));
           }
-          if (sources.empty())
-            continue;
-          llvm::sort(sources, [](const ObservableSource &a,
-                                 const ObservableSource &b) {
-            if (a.place != b.place)
-              return a.place.getValue() < b.place.getValue();
-            return a.takeValue.getAsOpaquePointer() <
-                   b.takeValue.getAsOpaquePointer();
-          });
-          StringAttr driver = sources.front().place;
-          if (driver != source)
-            continue;
 
-          for (TargetInfo &target : targets) {
-            SmallVector<ObservableSource> sourcesCopy = sources;
+          for (SmallVector<ObservableSource, 4> &sources : candidateSources) {
+            if (sources.empty())
+              continue;
+            StringAttr driver = sources.front().place;
+            if (driver != driverPlace)
+              continue;
+
+            for (TargetInfo &target : targets) {
+              SmallVector<ObservableSource, 4> sourcesCopy = sources;
             SmallVector<TokenEditSignature> editSummary;
             DenseMap<Value, llvm::hash_code> hashCache;
             if (failed(summarizeTokenEdits(tokenVal, take.getResult(),
@@ -813,7 +851,7 @@ struct LPNRetainHypergraphPass
             llvm::hash_code tokenHash = hashOptionalValue(tokenVal, hashCache);
             llvm::hash_code delayHash =
                 hashOptionalValue(emit.getDelay(), hashCache);
-            auto templ = std::make_unique<EdgeTemplate>(
+              auto templ = std::make_unique<EdgeTemplate>(
                 EdgeTemplate{driver,
                              take.getResult(),
                              target,
@@ -824,9 +862,10 @@ struct LPNRetainHypergraphPass
                              editSummary,
                              tokenHash,
                              delayHash});
-            const EdgeTemplate *ptr = templ.get();
-            adjacency[driver].push_back(ptr);
-            templates.push_back(std::move(templ));
+              const EdgeTemplate *ptr = templ.get();
+              adjacency[driver].push_back(ptr);
+              templates.push_back(std::move(templ));
+            }
           }
         }
       }

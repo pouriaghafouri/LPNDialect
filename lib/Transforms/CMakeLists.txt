@@ -3,7 +3,9 @@ add_mlir_library(MLIRLPNTransforms
   LPNValidationPass.cpp
   LPNNormalizeDelaysPass.cpp
   LPNAbstractHiddenStatePass.cpp
+  LPNSynthesizeGuardPass.cpp
   LPNStripHiddenValuesPass.cpp
+  LPNLinkTokenCreatesPass.cpp
   LPNResolveChoicePass.cpp
   LPNDataflowSimplifyPass.cpp
   LPNRetainObservablesPass.cpp

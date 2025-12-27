@@ -14,6 +14,8 @@ std::unique_ptr<Pass> createLPNRetainObservablesPass();
 std::unique_ptr<Pass> createLPNRetainHypergraphPass();
 std::unique_ptr<Pass> createLPNAbstractHiddenStatePass();
 std::unique_ptr<Pass> createLPNStripHiddenValuesPass();
+std::unique_ptr<Pass> createLPNSynthesizeGuardPass();
+std::unique_ptr<Pass> createLPNLinkTokenCreatesPass();
 std::unique_ptr<Pass> createLPNDataflowSimplifyPass();
 std::unique_ptr<Pass> createLPNResolveChoicePass();
 // ... other pass declarations

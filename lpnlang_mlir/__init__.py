@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 
 class Statement:
@@ -42,6 +42,25 @@ class IfStatement(Statement):
       lines.append(f"{indent}else {{")
       lines.extend(self._render_block(self.else_stmts, indent))
       lines.append(f"{indent}}}")
+    return "\n".join(lines)
+
+
+class ForStatement(Statement):
+  def __init__(self, iv: str, lower: str, upper: str, step: str,
+               body: List[Statement]):
+    self.iv = iv
+    self.lower = lower
+    self.upper = upper
+    self.step = step
+    self.body = body
+
+  def render(self, indent: str) -> str:
+    lines = [f"{indent}scf.for {self.iv} = {self.lower} to {self.upper} step {self.step} {{"]
+    inner = indent + "  "
+    for stmt in self.body:
+      lines.append(stmt.render(inner))
+    lines.append(f"{inner}scf.yield")
+    lines.append(f"{indent}}}")
     return "\n".join(lines)
 
 
@@ -283,7 +302,9 @@ class TransitionBuilder:
     return self._wrap_value(name, "i1")
 
   def _capture_ops(
-      self, fn: Optional[Callable[['TransitionBuilder'], None]]
+      self,
+      fn: Optional[Callable[..., None]],
+      *fn_args: Any
   ) -> List[Statement]:
     if fn is None:
       return []
@@ -291,7 +312,7 @@ class TransitionBuilder:
     branch_ops: List[Statement] = []
     self._ops = branch_ops
     try:
-      fn(self)
+      fn(self, *fn_args)
     finally:
       self._ops = saved_ops
     return branch_ops
@@ -314,6 +335,19 @@ class TransitionBuilder:
         raise TypeError("delay must be an f64 value")
       return delay
     return self.const_f64(float(delay))
+
+  def divi(self,
+           lhs: Union[Value, int],
+           rhs: Union[Value, int],
+           *,
+           typ: str = "i64",
+           signed: bool = True) -> Value:
+    lhs_val = self._coerce_value(lhs, typ)
+    rhs_val = self._coerce_value(rhs, typ)
+    name = self._next_value()
+    op = "arith.divsi" if signed else "arith.divui"
+    self._append(f"{name} = {op} {lhs_val}, {rhs_val} : {typ}")
+    return self._wrap_value(name, typ)
 
   def take(self, place: Union[PlaceHandle, Value]) -> TokenValue:
     handle = self._resolve_place_operand(place)
@@ -409,6 +443,21 @@ class TransitionBuilder:
 
   def materialize_place(self, place: PlaceHandle) -> None:
     self._ensure_place_handle(place)
+
+  def for_range(self,
+                lower: Union[Value, int],
+                upper: Union[Value, int],
+                *,
+                step: Union[Value, int] = 1,
+                body: Callable[['TransitionBuilder', Value], None]) -> None:
+    lb = self._coerce_value(lower, "index")
+    ub = self._coerce_value(upper, "index")
+    st = self._coerce_value(step, "index")
+    iv_name = self._next_value()
+    iv_value = self._wrap_value(iv_name, "index")
+    body_ops = self._capture_ops(body, iv_value)
+    self._ops.append(
+        ForStatement(iv_name, lb.name, ub.name, st.name, body_ops))
 
   def render(self) -> List[str]:
     ops = []
