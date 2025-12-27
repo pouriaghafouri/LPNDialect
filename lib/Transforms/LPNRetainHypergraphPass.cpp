@@ -178,8 +178,11 @@ struct TokenEditSignature {
   SmallVector<unsigned, 4> sourceRefs;
 };
 
+enum class ContextKind { IfOp, ChoiceOp, ForOp };
+
 struct ControlContext {
   Operation *op;
+  ContextKind kind;
   bool isThen;
 };
 
@@ -565,8 +568,10 @@ static Value cloneValueInto(Value value, IRMapping &mapping,
     return mapped;
 
   if (auto arg = dyn_cast<BlockArgument>(value)) {
+    if (Value mapped = mapping.lookupOrNull(arg))
+      return mapped;
     arg.getOwner()->getParentOp()->emitError(
-        "block arguments are unsupported in retain-observables");
+        "unmapped block argument while cloning hypergraph slice");
     return {};
   }
 
@@ -616,6 +621,12 @@ static Value ensureDelay(Value delay, ImplicitLocOpBuilder &builder) {
 
 using TokenEnv = DenseMap<StringAttr, SmallVector<Value>>;
 using TakeEnv = DenseMap<Value, Value>;
+using SSAEnv = DenseMap<Value, Value>;
+
+static void mapContextValues(const SSAEnv &env, IRMapping &mapping) {
+  for (const auto &entry : env)
+    mapping.map(entry.first, entry.second);
+}
 
 static void mapTemplateSources(const EdgeTemplate *templ, IRMapping &mapping,
                                const TakeEnv &takes) {
@@ -720,15 +731,34 @@ struct LPNRetainHypergraphPass
           Operation *parent = emit.getOperation()->getParentOp();
 
           while (parent && parent != trans) {
+            Block *emitBlock = emit->getBlock();
             if (auto ifOp = dyn_cast<scf::IfOp>(parent)) {
               Region &thenRegion = ifOp.getThenRegion();
               Region &elseRegion = ifOp.getElseRegion();
-              Block *emitBlock = emit->getBlock();
               bool inThen = blockInRegion(emitBlock, thenRegion);
               bool inElse = blockInRegion(emitBlock, elseRegion);
               assert((inThen || inElse) &&
                      "emit block must belong to either then or else region");
-              contexts.push_back({ifOp.getOperation(), inThen});
+              bool hidden = ifOp->hasAttr("lpn.hidden_choice");
+              contexts.push_back({ifOp.getOperation(),
+                                  hidden ? ContextKind::ChoiceOp
+                                         : ContextKind::IfOp,
+                                  inThen});
+            } else if (auto choice = dyn_cast<ChoiceOp>(parent)) {
+              Region &thenRegion = choice.getThenRegion();
+              Region &elseRegion = choice.getElseRegion();
+              bool inThen = blockInRegion(emitBlock, thenRegion);
+              bool inElse = blockInRegion(emitBlock, elseRegion);
+              assert((inThen || inElse) &&
+                     "emit block must belong to either choice branch");
+              contexts.push_back(
+                  {choice.getOperation(), ContextKind::ChoiceOp, inThen});
+            } else if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
+              Region &body = forOp.getRegion();
+              assert(blockInRegion(emitBlock, body) &&
+                     "loop body must contain emit");
+              contexts.push_back(
+                  {forOp.getOperation(), ContextKind::ForOp, true});
             }
             parent = parent->getParentOp();
           }
@@ -739,9 +769,19 @@ struct LPNRetainHypergraphPass
           collectTakeDependencies(tokenVal, requiredTakes);
           collectTakeDependencies(emit.getPlace(), requiredTakes);
           collectTakeDependencies(emit.getDelay(), requiredTakes);
-          for (const ControlContext &ctx : contexts)
-            if (auto ifOp = dyn_cast<scf::IfOp>(ctx.op))
-              collectTakeDependencies(ifOp.getCondition(), requiredTakes);
+          for (const ControlContext &ctx : contexts) {
+            if (ctx.kind == ContextKind::IfOp) {
+              if (auto ifOp = dyn_cast<scf::IfOp>(ctx.op))
+                collectTakeDependencies(ifOp.getCondition(), requiredTakes);
+              continue;
+            }
+            if (ctx.kind == ContextKind::ForOp) {
+              auto forOp = dyn_cast<scf::ForOp>(ctx.op);
+              collectTakeDependencies(forOp.getLowerBound(), requiredTakes);
+              collectTakeDependencies(forOp.getUpperBound(), requiredTakes);
+              collectTakeDependencies(forOp.getStep(), requiredTakes);
+            }
+          }
 
           SmallVector<ObservableSource> sources;
           for (Value dep : requiredTakes) {
@@ -854,8 +894,10 @@ struct LPNRetainHypergraphPass
       for (const PathCursor &cursor : cursors) {
         TokenEnv pathTokens = tokens;
         TakeEnv pathTakes = takes;
+        SSAEnv pathSSA;
         if (failed(processCursor(cursor, seed, Value(), std::move(pathTokens),
-                                 std::move(pathTakes), builder)))
+                                 std::move(pathTakes), std::move(pathSSA),
+                                 builder)))
           return failure();
       }
       builder.create<ScheduleReturnOp>();
@@ -901,33 +943,42 @@ struct LPNRetainHypergraphPass
 
 LogicalResult processCursor(PathCursor cursor, Value token,
                             Value accumulatedDelay, TokenEnv tokens,
-                            TakeEnv takes,
+                            TakeEnv takes, SSAEnv ssaEnv,
                             ImplicitLocOpBuilder &builder) const {
   const EdgeTemplate *templ = getTemplate(cursor);
   if (!templ)
     return success();
   if (cursor.contextIndex < templ->contexts.size()) {
     const ControlContext &ctx = templ->contexts[cursor.contextIndex];
-    if (ctx.op->hasAttr("lpn.hidden_choice"))
+    if (ctx.kind == ContextKind::ChoiceOp)
       return emitChoiceBranch(cursor, templ, ctx.isThen, token,
                               accumulatedDelay, std::move(tokens),
-                              std::move(takes), builder);
+                              std::move(takes), std::move(ssaEnv), builder);
+    if (ctx.kind == ContextKind::ForOp) {
+      auto forOp = dyn_cast<scf::ForOp>(ctx.op);
+      if (!forOp)
+        return builder.getInsertionBlock()->getParentOp()->emitError(
+            "malformed loop context");
+      return emitForBranch(cursor, templ, forOp, token, accumulatedDelay,
+                           std::move(tokens), std::move(takes),
+                           std::move(ssaEnv), builder);
+    }
     auto ifOp = dyn_cast<scf::IfOp>(ctx.op);
     if (!ifOp)
       return builder.getInsertionBlock()->getParentOp()->emitError(
           "unsupported control context");
     return emitIfBranch(cursor, templ, ifOp, ctx.isThen, token,
                         accumulatedDelay, std::move(tokens), std::move(takes),
-                        builder);
+                        std::move(ssaEnv), builder);
   }
   return emitLeaf(cursor, templ, token, accumulatedDelay, std::move(tokens),
-                  std::move(takes), builder);
+                  std::move(takes), std::move(ssaEnv), builder);
 }
 
 LogicalResult emitIfBranch(PathCursor cursor, const EdgeTemplate *templ,
                            scf::IfOp ifOp, bool takeThen, Value token,
                            Value accumulatedDelay, TokenEnv tokens,
-                           TakeEnv takes,
+                           TakeEnv takes, SSAEnv ssaEnv,
                            ImplicitLocOpBuilder &builder) const {
   TokenEnv condTokens = tokens;
   TakeEnv condTakes = takes;
@@ -935,6 +986,7 @@ LogicalResult emitIfBranch(PathCursor cursor, const EdgeTemplate *templ,
           ensureTemplateSources(templ, token, condTokens, condTakes, builder)))
     return failure();
   IRMapping mapping;
+  mapContextValues(ssaEnv, mapping);
   mapTemplateSources(templ, mapping, condTakes);
   Value cond = cloneValueInto(ifOp.getCondition(), mapping, builder);
   if (!cond)
@@ -942,7 +994,7 @@ LogicalResult emitIfBranch(PathCursor cursor, const EdgeTemplate *templ,
   scf::IfOp clonedIf =
       builder.create<scf::IfOp>(TypeRange(), cond, /*withElse=*/true);
   auto populate = [&](Region &region, bool active, TokenEnv branchTokens,
-                      TakeEnv branchTakes) -> LogicalResult {
+                      TakeEnv branchTakes, SSAEnv branchEnv) -> LogicalResult {
     region.getBlocks().clear();
     Block &block = region.emplaceBlock();
     ImplicitLocOpBuilder branchBuilder(builder.getLoc(),
@@ -953,17 +1005,18 @@ LogicalResult emitIfBranch(PathCursor cursor, const EdgeTemplate *templ,
       next.contextIndex++;
       if (failed(processCursor(next, token, accumulatedDelay,
                                std::move(branchTokens),
-                               std::move(branchTakes), branchBuilder)))
+                               std::move(branchTakes), std::move(branchEnv),
+                               branchBuilder)))
         return failure();
     }
     branchBuilder.create<scf::YieldOp>();
     return success();
   };
   if (failed(populate(clonedIf.getThenRegion(), takeThen, condTokens,
-                      condTakes)))
+                      condTakes, ssaEnv)))
     return failure();
   if (failed(populate(clonedIf.getElseRegion(), !takeThen, std::move(tokens),
-                      std::move(takes))))
+                      std::move(takes), std::move(ssaEnv))))
     return failure();
   builder.setInsertionPointAfter(clonedIf);
   return success();
@@ -972,10 +1025,11 @@ LogicalResult emitIfBranch(PathCursor cursor, const EdgeTemplate *templ,
 LogicalResult emitChoiceBranch(PathCursor cursor, const EdgeTemplate *templ,
                                bool useThen, Value token,
                                Value accumulatedDelay, TokenEnv tokens,
-                               TakeEnv takes,
+                               TakeEnv takes, SSAEnv ssaEnv,
                                ImplicitLocOpBuilder &builder) const {
   auto choice = builder.create<ChoiceOp>();
-  auto populate = [&](Region &region, bool active) -> LogicalResult {
+  auto populate = [&](Region &region, bool active, TokenEnv branchTokens,
+                      TakeEnv branchTakes, SSAEnv branchEnv) -> LogicalResult {
     region.getBlocks().clear();
     Block &block = region.emplaceBlock();
     ImplicitLocOpBuilder branchBuilder(builder.getLoc(),
@@ -985,77 +1039,116 @@ LogicalResult emitChoiceBranch(PathCursor cursor, const EdgeTemplate *templ,
       PathCursor next = cursor;
       next.contextIndex++;
       if (failed(processCursor(next, token, accumulatedDelay,
-                               std::move(tokens), std::move(takes),
+                               std::move(branchTokens),
+                               std::move(branchTakes), std::move(branchEnv),
                                branchBuilder)))
         return failure();
     }
     branchBuilder.create<ChoiceYieldOp>();
     return success();
   };
-  if (failed(populate(choice.getThenRegion(), useThen)))
+  if (failed(populate(choice.getThenRegion(), useThen, tokens, takes, ssaEnv)))
     return failure();
-  if (failed(populate(choice.getElseRegion(), !useThen)))
+  if (failed(populate(choice.getElseRegion(), !useThen, std::move(tokens),
+                      std::move(takes), std::move(ssaEnv))))
     return failure();
   builder.setInsertionPointAfter(choice);
   return success();
 }
 
-  LogicalResult emitLeaf(PathCursor cursor, const EdgeTemplate *templ,
-                         Value token, Value accumulatedDelay, TokenEnv tokens,
-                         TakeEnv takes,
-                         ImplicitLocOpBuilder &builder) const {
-    auto emitBody = [&](ImplicitLocOpBuilder &inner, Value currentToken,
-                        Value currentDelay, TokenEnv innerTokens,
-                        TakeEnv innerTakes) -> LogicalResult {
-      if (failed(ensureTemplateSources(templ, currentToken, innerTokens,
-                                       innerTakes, inner)))
-        return failure();
-      IRMapping mapping;
-      mapTemplateSources(templ, mapping, innerTakes);
-      Value newToken = cloneValueInto(templ->tokenValue, mapping, inner);
-      if (!newToken)
-        return failure();
-      Value stepDelay = cloneValueInto(templ->delayValue, mapping, inner);
-      if (!stepDelay)
-        return failure();
-      Value totalDelay = ensureDelay(currentDelay, inner);
-      totalDelay =
-          inner.create<arith::AddFOp>(totalDelay, stepDelay).getResult();
-      innerTokens[templ->target.symbol].push_back(newToken);
-      bool last = cursor.path && (cursor.edgeIndex + 1 == cursor.path->size());
-      if (last) {
-        auto placeType = PlaceType::get(inner.getContext());
-        auto placeAttr = FlatSymbolRefAttr::get(templ->target.symbol);
-        Value place = inner.create<PlaceRefOp>(placeType, placeAttr);
-        inner.create<EmitOp>(place, newToken, totalDelay);
-        return success();
-      }
-      PathCursor next{cursor.path, cursor.edgeIndex + 1, 0};
-      return processCursor(next, newToken, totalDelay, std::move(innerTokens),
-                           std::move(innerTakes), inner);
-    };
+LogicalResult emitForBranch(PathCursor cursor, const EdgeTemplate *templ,
+                            scf::ForOp forOp, Value token,
+                            Value accumulatedDelay, TokenEnv tokens,
+                            TakeEnv takes, SSAEnv ssaEnv,
+                            ImplicitLocOpBuilder &builder) const {
+  if (forOp.getNumRegionIterArgs() != 0)
+    return builder.getInsertionBlock()->getParentOp()->emitError(
+        "retain pass does not support scf.for with iter_args");
+  TokenEnv loopTokens = tokens;
+  TakeEnv loopTakes = takes;
+  if (failed(ensureTemplateSources(templ, token, loopTokens, loopTakes,
+                                   builder)))
+    return failure();
+  IRMapping mapping;
+  mapContextValues(ssaEnv, mapping);
+  mapTemplateSources(templ, mapping, loopTakes);
+  Value lower = cloneValueInto(forOp.getLowerBound(), mapping, builder);
+  Value upper = cloneValueInto(forOp.getUpperBound(), mapping, builder);
+  Value step = cloneValueInto(forOp.getStep(), mapping, builder);
+  if (!lower || !upper || !step)
+    return failure();
+  scf::ForOp cloned = builder.create<scf::ForOp>(lower, upper, step);
+  Block &body = cloned.getRegion().front();
+  body.clear();
+  ImplicitLocOpBuilder inner(builder.getLoc(), builder.getContext());
+  inner.setInsertionPointToStart(&body);
+  SSAEnv innerEnv = ssaEnv;
+  innerEnv[forOp.getBody()->getArgument(0)] = cloned.getInductionVar();
+  PathCursor next = cursor;
+  next.contextIndex++;
+  if (failed(processCursor(next, token, accumulatedDelay,
+                           std::move(loopTokens), std::move(loopTakes),
+                           std::move(innerEnv), inner)))
+    return failure();
+  inner.create<scf::YieldOp>();
+  builder.setInsertionPointAfter(cloned);
+  return success();
+}
 
-    if (templ->target.guards.empty())
-      return emitBody(builder, token, accumulatedDelay, std::move(tokens),
-                      std::move(takes));
-
-    Value cond = buildGuardCondition(templ->target.guards, token, builder);
-    if (!cond)
-      return builder.getInsertionBlock()->getParentOp()->emitError(
-          "failed to build guard condition");
-    scf::IfOp guardIf =
-        builder.create<scf::IfOp>(TypeRange(), cond, /*withElse=*/false);
-    auto &guardBlock = guardIf.getThenRegion().front();
-    guardBlock.clear();
-    ImplicitLocOpBuilder inner(builder.getLoc(), builder.getContext());
-    inner.setInsertionPointToStart(&guardBlock);
-    if (failed(emitBody(inner, token, accumulatedDelay, std::move(tokens),
-                        std::move(takes))))
+LogicalResult emitLeaf(PathCursor cursor, const EdgeTemplate *templ,
+                       Value token, Value accumulatedDelay, TokenEnv tokens,
+                       TakeEnv takes, SSAEnv ssaEnv,
+                       ImplicitLocOpBuilder &builder) const {
+  auto emitBody = [&](ImplicitLocOpBuilder &inner, Value currentToken,
+                      Value currentDelay, TokenEnv innerTokens,
+                      TakeEnv innerTakes, SSAEnv innerEnv) -> LogicalResult {
+    if (failed(ensureTemplateSources(templ, currentToken, innerTokens,
+                                     innerTakes, inner)))
       return failure();
-    inner.create<scf::YieldOp>();
-    builder.setInsertionPointAfter(guardIf);
-    return success();
-  }
+    IRMapping mapping;
+    mapContextValues(innerEnv, mapping);
+    mapTemplateSources(templ, mapping, innerTakes);
+    Value newToken = cloneValueInto(templ->tokenValue, mapping, inner);
+    if (!newToken)
+      return failure();
+    Value stepDelay = cloneValueInto(templ->delayValue, mapping, inner);
+    if (!stepDelay)
+      return failure();
+    Value totalDelay = ensureDelay(currentDelay, inner);
+    totalDelay =
+        inner.create<arith::AddFOp>(totalDelay, stepDelay).getResult();
+    innerTokens[templ->target.symbol].push_back(newToken);
+    bool last = cursor.path && (cursor.edgeIndex + 1 == cursor.path->size());
+    if (last) {
+      auto placeType = PlaceType::get(inner.getContext());
+      auto placeAttr = FlatSymbolRefAttr::get(templ->target.symbol);
+      Value place = inner.create<PlaceRefOp>(placeType, placeAttr);
+      inner.create<EmitOp>(place, newToken, totalDelay);
+      return success();
+    }
+    PathCursor next{cursor.path, cursor.edgeIndex + 1, 0};
+    return processCursor(next, newToken, totalDelay, std::move(innerTokens),
+                         std::move(innerTakes), std::move(innerEnv), inner);
+  };
+
+  Value cond = buildGuardCondition(templ->target.guards, token, builder);
+  if (!cond)
+    return emitBody(builder, token, accumulatedDelay, std::move(tokens),
+                    std::move(takes), std::move(ssaEnv));
+
+  scf::IfOp guardIf =
+      builder.create<scf::IfOp>(TypeRange(), cond, /*withElse=*/false);
+  auto &guardBlock = guardIf.getThenRegion().front();
+  guardBlock.clear();
+  ImplicitLocOpBuilder inner(builder.getLoc(), builder.getContext());
+  inner.setInsertionPointToStart(&guardBlock);
+  if (failed(emitBody(inner, token, accumulatedDelay, std::move(tokens),
+                      std::move(takes), std::move(ssaEnv))))
+    return failure();
+  inner.create<scf::YieldOp>();
+  builder.setInsertionPointAfter(guardIf);
+  return success();
+}
 };
 
 } // namespace
