@@ -16,8 +16,10 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/raw_ostream.h"
 #include <memory>
 #include <iterator>
 #include <cassert>
@@ -166,7 +168,8 @@ static bool blockInRegion(Block *block, Region &region) {
 
 /// Single equality predicate derived from token metadata.
 struct TokenGuard {
-  StringAttr field;
+  Value key;
+  llvm::hash_code keyHash = {};
   int64_t equalsValue;
 };
 
@@ -177,8 +180,8 @@ struct TargetInfo {
 };
 
 struct TokenEditSignature {
-  StringAttr field;
-  llvm::hash_code valueHash;
+  llvm::hash_code keyHash = {};
+  llvm::hash_code valueHash = {};
   SmallVector<unsigned, 4> sourceRefs;
 };
 
@@ -222,9 +225,14 @@ struct PathCursor {
 static bool guardsEqual(ArrayRef<TokenGuard> lhs, ArrayRef<TokenGuard> rhs) {
   if (lhs.size() != rhs.size())
     return false;
-  for (auto [a, b] : llvm::zip(lhs, rhs))
-    if (a.field != b.field || a.equalsValue != b.equalsValue)
+  for (auto [a, b] : llvm::zip(lhs, rhs)) {
+    if (a.equalsValue != b.equalsValue)
       return false;
+    if ((a.key && !b.key) || (!a.key && b.key))
+      return false;
+    if (a.key && a.keyHash != b.keyHash)
+      return false;
+  }
   return true;
 }
 
@@ -233,7 +241,7 @@ static bool editsEqual(ArrayRef<TokenEditSignature> lhs,
   if (lhs.size() != rhs.size())
     return false;
   for (auto [a, b] : llvm::zip(lhs, rhs))
-    if (a.field != b.field || a.valueHash != b.valueHash)
+    if (a.keyHash != b.keyHash || a.valueHash != b.valueHash)
       return false;
   return true;
 }
@@ -373,6 +381,21 @@ static llvm::hash_code hashOptionalValue(Value value,
   return hashValueExpr(value, cache);
 }
 
+static void recordSourceRefs(Value root, TokenEditSignature &sig,
+                             ArrayRef<ObservableSource> sources,
+                             SmallPtrSetImpl<Value> &visited) {
+  if (!root || !visited.insert(root).second)
+    return;
+  if (auto get = root.getDefiningOp<TokenGetOp>()) {
+    for (auto [idx, src] : llvm::enumerate(sources))
+      if (src.takeValue == get.getToken())
+        sig.sourceRefs.push_back(idx);
+  }
+  if (Operation *producer = root.getDefiningOp())
+    for (Value operand : producer->getOperands())
+      recordSourceRefs(operand, sig, sources, visited);
+}
+
 // token edits supported only clone and set ops
 // get ops didn't change the token, so they are ignored
 static LogicalResult summarizeTokenEdits(
@@ -389,21 +412,11 @@ static LogicalResult summarizeTokenEdits(
                                    sources)))
       return failure();
     TokenEditSignature sig;
-    sig.field = set.getFieldAttr();
+    sig.keyHash = hashValueExpr(set.getKey(), hashCache);
     sig.valueHash = hashValueExpr(set.getValue(), hashCache);
-    auto recordRefs = [&](auto &&self, Value v) -> void {
-      if (!v)
-        return;
-      if (auto get = v.getDefiningOp<TokenGetOp>()) {
-        for (auto [idx, src] : llvm::enumerate(sources))
-          if (src.takeValue == get.getToken())
-            sig.sourceRefs.push_back(idx);
-      }
-      if (Operation *producer = v.getDefiningOp())
-        for (Value operand : producer->getOperands())
-          self(self, operand);
-    };
-    recordRefs(recordRefs, set.getValue());
+    SmallPtrSet<Value, 8> visited;
+    recordSourceRefs(set.getValue(), sig, sources, visited);
+    recordSourceRefs(set.getKey(), sig, sources, visited);
     edits.push_back(std::move(sig));
     return success();
   }
@@ -434,16 +447,20 @@ static std::optional<int64_t> getConstI64(Value value) {
 /// Attempt to infer a metadata guard for a place_list slot.
 static std::optional<TokenGuard> matchListIndexGuard(Value index,
                                                      int64_t slot) {
+  DenseMap<Value, llvm::hash_code> guardHashCache;
   Value current = stripIndexCasts(index);
-
-  if (auto get = current.getDefiningOp<TokenGetOp>())
-    return TokenGuard{get.getFieldAttr(), slot};
 
   auto buildGuard = [&](TokenGetOp get, int64_t offset,
                         bool add) -> std::optional<TokenGuard> {
-    int64_t base = add ? slot - offset : slot + offset;
-    return TokenGuard{get.getFieldAttr(), base};
+    TokenGuard guard;
+    guard.key = get.getKey();
+    guard.keyHash = hashValueExpr(guard.key, guardHashCache);
+    guard.equalsValue = add ? slot - offset : slot + offset;
+    return guard;
   };
+
+  if (auto get = current.getDefiningOp<TokenGetOp>())
+    return buildGuard(get, /*offset=*/0, /*add=*/true);
 
   if (auto subi = current.getDefiningOp<arith::SubIOp>()) {
     if (auto lhs = subi.getLhs().getDefiningOp<TokenGetOp>())
@@ -463,8 +480,12 @@ static std::optional<TokenGuard> matchListIndexGuard(Value index,
         return buildGuard(rhs, *lhsConst, /*add=*/true);
   }
 
-  if (auto constIdx = getConstI64(current))
-    return TokenGuard{StringAttr{}, constIdx.value()};
+  if (auto constIdx = getConstI64(current)) {
+    TokenGuard guard;
+    guard.equalsValue = constIdx.value();
+    guard.keyHash = hashOptionalValue(Value(), guardHashCache);
+    return guard;
+  }
 
   return std::nullopt;
 }
@@ -501,7 +522,7 @@ static LogicalResult resolveEmitTargets(Value placeValue,
       TargetInfo info;
       info.symbol = sym.getAttr();
       if (auto guard = matchListIndexGuard(get.getIndex(), slot))
-        if (guard->field)
+        if (guard->key)
           info.guards.push_back(*guard);
       targets.push_back(std::move(info));
     }
@@ -573,24 +594,6 @@ static Value cloneValueInto(Value value, IRMapping &mapping,
   return clone->getResult(result.getResultNumber());
 }
 
-static Value buildGuardCondition(const SmallVectorImpl<TokenGuard> &guards,
-                                 Value token, ImplicitLocOpBuilder &builder) {
-  if (guards.empty())
-    return {};
-  auto i64Ty = IntegerType::get(builder.getContext(), 64);
-  Value condition;
-  for (const TokenGuard &guard : guards) {
-    if (!guard.field)
-      continue;
-    Value lhs = builder.create<TokenGetOp>(i64Ty, token, guard.field);
-    Value rhs = builder.create<arith::ConstantOp>(
-        builder.getI64IntegerAttr(guard.equalsValue));
-    Value eq = builder.create<arith::CmpIOp>(arith::CmpIPredicate::eq, lhs, rhs);
-    condition = condition ? builder.create<arith::AndIOp>(condition, eq) : eq;
-  }
-  return condition;
-}
-
 /// Helper to ensure a valid accumulated delay value exists.
 static Value ensureDelay(Value delay, ImplicitLocOpBuilder &builder) {
   if (delay)
@@ -658,6 +661,32 @@ static LogicalResult ensureTemplateSources(const EdgeTemplate *templ,
   return success();
 }
 
+static Value buildGuardCondition(const SmallVectorImpl<TokenGuard> &guards,
+                                 const EdgeTemplate *templ, CursorState &state,
+                                 ImplicitLocOpBuilder &builder) {
+  if (guards.empty())
+    return {};
+  auto i64Ty = IntegerType::get(builder.getContext(), 64);
+  IRMapping mapping;
+  mapContextValues(state.ssa, mapping);
+  mapTemplateSources(templ, mapping, state.takes);
+  mapping.map(templ->driverTake, state.token);
+  Value condition;
+  for (const TokenGuard &guard : guards) {
+    if (!guard.key)
+      continue;
+    Value keyValue = cloneValueInto(guard.key, mapping, builder);
+    if (!keyValue)
+      return {};
+    Value lhs = builder.create<TokenGetOp>(i64Ty, state.token, keyValue);
+    Value rhs = builder.create<arith::ConstantOp>(
+        builder.getI64IntegerAttr(guard.equalsValue));
+    Value eq = builder.create<arith::CmpIOp>(arith::CmpIPredicate::eq, lhs, rhs);
+    condition = condition ? builder.create<arith::AndIOp>(condition, eq) : eq;
+  }
+  return condition;
+}
+
 //===----------------------------------------------------------------------===//
 // Pass driver
 //===----------------------------------------------------------------------===//
@@ -665,6 +694,15 @@ static LogicalResult ensureTemplateSources(const EdgeTemplate *templ,
 struct LPNRetainHypergraphPass
     : PassWrapper<LPNRetainHypergraphPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LPNRetainHypergraphPass)
+
+  struct NetStats {
+    uint64_t totalHyperedges = 0;
+    uint64_t guardHyperedges = 0;
+    uint64_t clusteredHyperedges = 0;
+    uint64_t rawPaths = 0;
+    uint64_t retainedPaths = 0;
+    uint64_t synthesizedTransitions = 0;
+  };
 
   StringRef getArgument() const final { return "lpn-retain-hypergraph"; }
   StringRef getDescription() const final {
@@ -684,6 +722,7 @@ struct LPNRetainHypergraphPass
   }
 
   LogicalResult processNet(NetOp net) {
+    NetStats stats;
     SmallVector<PlaceOp> observablePlaces;
     DenseSet<StringAttr> observableNames;
     for (PlaceOp place : net.getOps<PlaceOp>())
@@ -853,6 +892,7 @@ struct LPNRetainHypergraphPass
             candidateSources.push_back(std::move(fallbackSources));
           }
 
+          bool guardDerived = usedGuardMetadata;
           for (SmallVector<ObservableSource, 4> &sources : candidateSources) {
             if (sources.empty())
               continue;
@@ -884,6 +924,9 @@ struct LPNRetainHypergraphPass
               const EdgeTemplate *ptr = templ.get();
               adjacency[driver].push_back(ptr);
               templates.push_back(std::move(templ));
+              ++stats.totalHyperedges;
+              if (guardDerived)
+                ++stats.guardHyperedges;
             }
           }
         }
@@ -891,11 +934,17 @@ struct LPNRetainHypergraphPass
     }
 
     clusterHyperedges(adjacency);
+    stats.clusteredHyperedges = 0;
+    for (auto &entry : adjacency)
+      stats.clusteredHyperedges += entry.second.size();
 
-    if (adjacency.empty())
+    if (adjacency.empty()) {
+      reportNetStats(net, stats);
       return success();
+    }
 
     DenseMap<StringAttr, SmallVector<EdgePath>> observablePaths;
+    stats.rawPaths = 0;
     for (PlaceOp place : observablePlaces) {
       StringAttr root = place.getSymNameAttr();
       DenseSet<StringAttr> visited;
@@ -904,11 +953,18 @@ struct LPNRetainHypergraphPass
       dfsPaths(root, root, visited, prefix, observableNames, adjacency,
                observablePaths);
     }
+    for (auto &entry : observablePaths)
+      stats.rawPaths += entry.second.size();
 
     dedupPaths(observablePaths);
+    stats.retainedPaths = 0;
+    for (auto &entry : observablePaths)
+      stats.retainedPaths += entry.second.size();
 
-    if (observablePaths.empty())
+    if (observablePaths.empty()) {
+      reportNetStats(net, stats);
       return success();
+    }
 
     HaltOp halt = nullptr;
     for (Operation &op : net.getBody().getOps())
@@ -957,6 +1013,7 @@ struct LPNRetainHypergraphPass
       if (failed(emitCursorSet(std::move(states), builder)))
         return failure();
       builder.create<ScheduleReturnOp>();
+      ++stats.synthesizedTransitions;
     }
 
     for (Operation *op : originalTransitions)
@@ -965,6 +1022,7 @@ struct LPNRetainHypergraphPass
       op->erase();
 
     simplifyChoiceLadders(net);
+    reportNetStats(net, stats);
     return success();
   }
 
@@ -978,6 +1036,7 @@ struct LPNRetainHypergraphPass
                              ImplicitLocOpBuilder &builder) const;
   LogicalResult emitLeaf(CursorState state, const EdgeTemplate *templ,
                          ImplicitLocOpBuilder &builder) const;
+  void reportNetStats(NetOp net, const NetStats &stats) const;
 
   const EdgeTemplate *getTemplate(const PathCursor &cursor) const {
     if (!cursor.path || cursor.edgeIndex >= cursor.path->size())
@@ -1220,12 +1279,11 @@ LogicalResult LPNRetainHypergraphPass::emitForGroup(ContextGroup &group,
 
 LogicalResult LPNRetainHypergraphPass::emitLeaf(CursorState state, const EdgeTemplate *templ,
                        ImplicitLocOpBuilder &builder) const {
+  if (failed(ensureTemplateSources(templ, state.token, state.tokens,
+                                   state.takes, builder)))
+    return failure();
   auto emitBody = [&](CursorState innerState,
                       ImplicitLocOpBuilder &inner) -> LogicalResult {
-    if (failed(ensureTemplateSources(templ, innerState.token,
-                                     innerState.tokens, innerState.takes,
-                                     inner)))
-      return failure();
     IRMapping mapping;
     mapContextValues(innerState.ssa, mapping);
     mapTemplateSources(templ, mapping, innerState.takes);
@@ -1259,7 +1317,8 @@ LogicalResult LPNRetainHypergraphPass::emitLeaf(CursorState state, const EdgeTem
     return emitCursorSet(std::move(children), inner);
   };
 
-  Value cond = buildGuardCondition(templ->target.guards, state.token, builder);
+  Value cond =
+      buildGuardCondition(templ->target.guards, templ, state, builder);
   if (!cond)
     return emitBody(std::move(state), builder);
 
@@ -1274,6 +1333,20 @@ LogicalResult LPNRetainHypergraphPass::emitLeaf(CursorState state, const EdgeTem
   inner.create<scf::YieldOp>();
   builder.setInsertionPointAfter(guardIf);
   return success();
+}
+
+void LPNRetainHypergraphPass::reportNetStats(NetOp net,
+                                             const NetStats &stats) const {
+  uint64_t fallback = 0;
+  if (stats.totalHyperedges >= stats.guardHyperedges)
+    fallback = stats.totalHyperedges - stats.guardHyperedges;
+  auto diag = net.emitRemark();
+  diag << "[lpn-retain-hypergraph] hyperedges(before cluster)="
+       << stats.totalHyperedges << " (guard=" << stats.guardHyperedges
+       << ", fallback=" << fallback << "), unique="
+       << stats.clusteredHyperedges << "; paths=" << stats.retainedPaths
+       << "/" << stats.rawPaths << "; transitions="
+       << stats.synthesizedTransitions;
 }
 
 

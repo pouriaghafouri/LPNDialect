@@ -234,6 +234,36 @@ def TokenCloneOp : LPN_Op<"token.clone", [Pure]> {
     "$token attr-dict `:` type($token) `->` type($copy)";
 }
 
+def KeyLiteralOp : LPN_Op<"key.literal", [Pure]> {
+  let summary = "Materialize a log key from a literal string";
+
+  let description = [{
+    Produces a key handle that references the literal `value`.  Dynamic keys can
+    be created by chaining `lpn.key.index` ops.
+  }];
+
+  let arguments = (ins StrAttr:$value);
+  let results = (outs KeyType:$key);
+
+  let assemblyFormat = "$value attr-dict `:` type($key)";
+}
+
+def KeyIndexOp : LPN_Op<"key.index", [Pure]> {
+  let summary = "Append a decimal index to an existing key";
+
+  let description = [{
+    Creates a new key handle by concatenating the decimal form of `index` to the
+    textual representation of `base`.  This mirrors the old
+    `token.{get,set}_indexed` helpers while keeping keys explicit in SSA.
+  }];
+
+  let arguments = (ins KeyType:$base, I64:$index);
+  let results = (outs KeyType:$key);
+
+  let assemblyFormat =
+    "$base `,` $index attr-dict `:` type($base) `,` type($index) `->` type($key)";
+}
+
 def TokenSetOp : LPN_Op<"token.set", [Pure]> {
   let summary = "Append a `(key, value)` entry to a token log";
 
@@ -247,7 +277,7 @@ def TokenSetOp : LPN_Op<"token.set", [Pure]> {
 
   let arguments = (ins
     TokenType:$token,
-    StrAttr:$field,
+    KeyType:$key,
     I64:$value
   );
 
@@ -256,7 +286,7 @@ def TokenSetOp : LPN_Op<"token.set", [Pure]> {
   );
 
   let assemblyFormat =
-    "$token `,` $field `,` $value attr-dict `:` type($token) `->` type($updated)";
+    "$token `,` $key `,` $value attr-dict `:` type($token) `,` type($key) `,` type($value) `->` type($updated)";
 }
 
 def TokenGetOp : LPN_Op<"token.get", [Pure]> {
@@ -271,7 +301,7 @@ def TokenGetOp : LPN_Op<"token.get", [Pure]> {
 
   let arguments = (ins
     TokenType:$token,
-    StrAttr:$field
+    KeyType:$key
   );
 
   let results = (outs
@@ -279,7 +309,7 @@ def TokenGetOp : LPN_Op<"token.get", [Pure]> {
   );
 
   let assemblyFormat =
-    "$token `,` $field attr-dict `:` type($token) `->` type($value)";
+    "$token `,` $key attr-dict `:` type($token) `,` type($key) `->` type($value)";
 }
 
 //===----------------------------------------------------------------------===//

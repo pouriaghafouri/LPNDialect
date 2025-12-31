@@ -20,3 +20,8 @@ PYTHONPATH=. python3 examples/split_merge_net.py > /tmp/split_merge.mlir
   --lpn-retain-hypergraph --lpn-strip-hidden-values \
   --lpn-resolve-choices --canonicalize --cse \
   --lpn-dataflow-simplify /tmp/split_merge.mlir > /tmp/split_merge_after.mlir
+
+./build/tools/lpn-opt/lpn-opt --lpn-synthesize-guards --lpn-normalize-delays \
+  --lpn-retain-hypergraph --lpn-strip-hidden-values \
+  --lpn-resolve-choices --canonicalize --cse \
+  --lpn-dataflow-simplify /tmp/hyper_demo.mlir > /tmp/hyper_demo_after.mlir

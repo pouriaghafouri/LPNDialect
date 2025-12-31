@@ -16,6 +16,19 @@ def TokenType : TypeDef<LPN_Dialect, "Token"> {
   let mnemonic = "token";
 }
 
+def KeyType : TypeDef<LPN_Dialect, "Key"> {
+  let summary = "Runtime handle representing a token metadata key";
+
+  let description = [{
+    Keys identify entries inside the append-only token log.  Literal keys are
+    constructed via `lpn.key.literal` and can be refined at runtime by
+    appending indices (via `lpn.key.index`).  Keeping keys explicit in the IR
+    makes downstream analyses resilient to dynamic metadata schemas.
+  }];
+
+  let mnemonic = "key";
+}
+
 def PlaceHandleType : TypeDef<LPN_Dialect, "Place"> {
   let summary = "Handle to a place";
 

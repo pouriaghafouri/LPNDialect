@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from lpnlang_mlir import NetBuilder, PlaceHandle
+from lpnlang_mlir import NetBuilder
 
 L1_HIT_DELAY_NS = 10.0
 L2_DELAY_NS = 100.0
@@ -41,49 +41,32 @@ def build_cache_example(addresses: Iterable[int]) -> str:
       state = t.token_set(state, f"line{idx}", t.const_i64(0))
     t.emit(state_place, state)
 
-  def build_line_chain(builder, line_value: str, req, state, idx: int):
-    const_idx = builder.const_i64(idx)
-    cond = builder.cmpi("eq", line_value, const_idx)
+  def read_line_flag(builder, token, line_idx):
+    return builder.token_get(token, ("line", line_idx))
 
-    def hit_branch(b):
-      valid = b.token_get(state, f"line{idx}")
-      one = b.const_i64(1)
-      is_valid = b.cmpi("ne", valid, b.const_i64(0))
-
-      def serve_hit(bb):
-        # resp = bb.token_set(req, "hit", one)
-        resp = req
-        delay = bb.const_f64(L1_HIT_DELAY_NS)
-        bb.emit(l1_resp, resp, delay=delay)
-        bb.emit(l1_state, state)
-
-      def serve_miss(bb):
-        # miss_token = bb.token_set(req, "hit", bb.const_i64(0))
-        miss_token = req
-        bb.emit(l2_req, miss_token)
-        bb.emit(l1_state, state)
-
-      b.if_op(is_valid, serve_hit, serve_miss)
-
-    def next_branch(b):
-      if idx + 1 < NUM_LINES:
-        build_line_chain(b, line_value, req, state, idx + 1)
-      else:
-        # miss_token = b.token_set(req, "hit", b.const_i64(0))
-        miss_token = req
-        b.emit(l2_req, miss_token)
-        b.emit(l1_state, state)
-
-    builder.if_op(cond, hit_branch, next_branch)
+  def write_line_flag(builder, token, line_idx, new_value):
+    return builder.token_set(token, ("line", line_idx), new_value)
 
   @net.transition("l1_controller")
   def _(t):
     req = t.take(l1_req)
     state = t.take(l1_state)
-    line_val = t.token_get(req, "line")
+    line_idx = t.token_get(req, "line")
+    line_valid = read_line_flag(t, state, line_idx)
+    has_line = t.cmpi("ne", line_valid, t.const_i64(0))
     t.materialize_place(l1_resp)
     t.materialize_place(l2_req)
-    build_line_chain(t, line_val, req, state, 0)
+
+    def serve_hit(b):
+      delay = b.const_f64(L1_HIT_DELAY_NS)
+      b.emit(l1_resp, req, delay=delay)
+      b.emit(l1_state, state)
+
+    def serve_miss(b):
+      b.emit(l2_req, req)
+      b.emit(l1_state, state)
+
+    t.if_op(has_line, serve_hit, serve_miss)
 
   @net.transition("l2_forward")
   def _(t):
@@ -91,33 +74,15 @@ def build_cache_example(addresses: Iterable[int]) -> str:
     delay = t.const_f64(L2_DELAY_NS)
     t.emit(l2_resp, req, delay=delay)
 
-  def build_fill_chain(builder, line_value: str, resp, state, idx: int):
-    const_idx = builder.const_i64(idx)
-    cond = builder.cmpi("eq", line_value, const_idx)
-
-    def set_line(bb):
-      updated = bb.token_set(state, f"line{idx}", bb.const_i64(1))
-      delay = bb.const_f64(L1_HIT_DELAY_NS)
-      bb.emit(l1_resp, resp, delay=delay)
-      bb.emit(l1_state, updated)
-
-    def next_branch(bb):
-      if idx + 1 < NUM_LINES:
-        build_fill_chain(bb, line_value, resp, state, idx + 1)
-      else:
-        delay = bb.const_f64(L1_HIT_DELAY_NS)
-        bb.emit(l1_resp, resp, delay=delay)
-        bb.emit(l1_state, state)
-
-    builder.if_op(cond, set_line, next_branch)
-
   @net.transition("l1_fill")
   def _(t):
     resp = t.take(l2_resp)
     state = t.take(l1_state)
-    line_val = t.token_get(resp, "line")
-    t.materialize_place(l1_resp)
-    build_fill_chain(t, line_val, resp, state, 0)
+    line_idx = t.token_get(resp, "line")
+    updated = write_line_flag(t, state, line_idx, t.const_i64(1))
+    delay = t.const_f64(L1_HIT_DELAY_NS)
+    t.emit(l1_resp, resp, delay=delay)
+    t.emit(l1_state, updated)
 
   return net.build()
 

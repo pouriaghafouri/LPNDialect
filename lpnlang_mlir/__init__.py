@@ -116,14 +116,27 @@ class TokenValue:
   def __str__(self) -> str:
     return self.name
 
-  def get(self, field: str) -> Value:
-    return self.builder.token_get(self, field)
+  def get(self, key: Union[str, "KeyValue",
+                            Tuple[Union[str, "KeyValue"], Union[Value, int]]]) -> Value:
+    return self.builder.token_get(self, key)
 
-  def set(self, field: str, value: Union[Value, int]) -> "TokenValue":
-    return self.builder.token_set(self, field, value)
+  def set(self,
+          key: Union[str, "KeyValue",
+                     Tuple[Union[str, "KeyValue"], Union[Value, int]]],
+          value: Union[Value, int]) -> "TokenValue":
+    return self.builder.token_set(self, key, value)
 
   def clone(self) -> "TokenValue":
     return self.builder.token_clone(self)
+
+
+@dataclass(frozen=True)
+class KeyValue:
+  builder: "TransitionBuilder"
+  name: str
+
+  def __str__(self) -> str:
+    return self.name
 
 
 @dataclass(frozen=True)
@@ -139,6 +152,7 @@ class TransitionBuilder:
     self._ops: List[Statement] = []
     self._value_id = 0
     self._place_handles: dict[str, Value] = {}
+    self._literal_keys: dict[str, KeyValue] = {}
     self._local_prefix = TransitionBuilder._global_id
     TransitionBuilder._global_id += 1
 
@@ -155,6 +169,9 @@ class TransitionBuilder:
 
   def _wrap_token(self, name: str) -> TokenValue:
     return TokenValue(self, name)
+
+  def _wrap_key(self, name: str) -> KeyValue:
+    return KeyValue(self, name)
 
   def _coerce_value(self, value: Union[Value, int, float], typ: str) -> Value:
     if isinstance(value, Value):
@@ -187,6 +204,40 @@ class TransitionBuilder:
       handle = self._wrap_value(name, "!lpn.place")
       self._place_handles[place.name] = handle
     return handle
+
+  def key_literal(self, name: str) -> KeyValue:
+    existing = self._literal_keys.get(name)
+    if existing is not None:
+      return existing
+    value = self._next_value()
+    self._append(
+        f"{value} = lpn.key.literal \"{name}\" : !lpn.key")
+    key = self._wrap_key(value)
+    self._literal_keys[name] = key
+    return key
+
+  def key_index(self, base: KeyValue, index: Union[Value, int]) -> KeyValue:
+    idx_value = self._coerce_value(index, "i64")
+    name = self._next_value()
+    self._append(
+        f"{name} = lpn.key.index {base.name}, {idx_value.name} : !lpn.key, i64 -> !lpn.key")
+    return self._wrap_key(name)
+
+  def _ensure_key(self,
+                  key: Union[str, KeyValue,
+                             Tuple[Union[str, KeyValue], Union[Value, int]]]
+                  ) -> KeyValue:
+    if isinstance(key, KeyValue):
+      return key
+    if isinstance(key, tuple):
+      if len(key) != 2:
+        raise ValueError("key tuple must be (base, index)")
+      base, index = key
+      base_key = self._ensure_key(base)
+      return self.key_index(base_key, index)
+    if isinstance(key, str):
+      return self.key_literal(key)
+    raise TypeError("expected a key literal string, KeyValue, or (base, index) tuple")
 
   def const_f64(self, value: float) -> Value:
     literal = f"{float(value):.6f}"
@@ -301,6 +352,29 @@ class TransitionBuilder:
     self._append(f"{name} = arith.cmpi {predicate}, {lhs_val}, {rhs_val} : {typ}")
     return self._wrap_value(name, "i1")
 
+  def select(self,
+             cond: Value,
+             true_value: Union[Value, int, float],
+             false_value: Union[Value, int, float],
+             *,
+             typ: Optional[str] = None) -> Value:
+    if not isinstance(cond, Value) or cond.typ != "i1":
+      raise TypeError("select condition must be an i1 Value")
+    value_type = typ
+    if value_type is None:
+      if isinstance(true_value, Value):
+        value_type = true_value.typ
+      elif isinstance(false_value, Value):
+        value_type = false_value.typ
+      else:
+        value_type = "i64"
+    true_val = self._coerce_value(true_value, value_type)
+    false_val = self._coerce_value(false_value, value_type)
+    name = self._next_value()
+    self._append(
+        f"{name} = arith.select {cond.name}, {true_val.name}, {false_val.name} : {value_type}")
+    return self._wrap_value(name, value_type)
+
   def _capture_ops(
       self,
       fn: Optional[Callable[..., None]],
@@ -389,20 +463,27 @@ class TransitionBuilder:
     self._append(f"{name} = lpn.count {handle} : !lpn.place -> i64")
     return self._wrap_value(name, "i64")
 
-  def token_get(self, token: TokenValue, field: str) -> Value:
+  def token_get(self,
+                token: TokenValue,
+                key: Union[str, KeyValue,
+                           Tuple[Union[str, KeyValue], Union[Value, int]]]
+                ) -> Value:
+    key_value = self._ensure_key(key)
     name = self._next_value()
     self._append(
-        f"{name} = \"lpn.token.get\"({token.name}) {{field = \"{field}\"}} : (!lpn.token) -> i64")
+        f"{name} = lpn.token.get {token.name}, {key_value.name} : !lpn.token, !lpn.key -> i64")
     return self._wrap_value(name, "i64")
 
   def token_set(self,
                 token: TokenValue,
-                field: str,
+                key: Union[str, KeyValue,
+                           Tuple[Union[str, KeyValue], Union[Value, int]]],
                 value_ssa: Union[Value, int]) -> TokenValue:
+    key_value = self._ensure_key(key)
     value = self._coerce_value(value_ssa, "i64")
     name = self._next_value()
     self._append(
-        f"{name} = \"lpn.token.set\"({token.name}, {value}) {{field = \"{field}\"}} : (!lpn.token, i64) -> !lpn.token")
+        f"{name} = lpn.token.set {token.name}, {key_value.name}, {value.name} : !lpn.token, !lpn.key, i64 -> !lpn.token")
     return self._wrap_token(name)
 
   def token_clone(self, token: TokenValue) -> TokenValue:

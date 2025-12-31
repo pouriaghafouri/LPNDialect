@@ -187,8 +187,9 @@ static void simplifyChoiceLadders(NetOp net) {
 
 /// Single equality predicate derived from token metadata.
 struct TokenGuard {
-  StringAttr field;
-  int64_t equalsValue;
+  Value key;
+  llvm::hash_code keyHash = {};
+  int64_t equalsValue = 0;
 };
 
 /// Destination place plus optional guards describing the routing condition.
@@ -198,8 +199,8 @@ struct TargetInfo {
 };
 
 struct TokenEditSignature {
-  StringAttr field;
-  llvm::hash_code valueHash;
+  llvm::hash_code keyHash = {};
+  llvm::hash_code valueHash = {};
 };
 
 struct ControlContext {
@@ -236,13 +237,19 @@ static bool equivalentTemplate(const EdgeTemplate *lhs,
   if (lhs->target.guards.size() != rhs->target.guards.size())
     return false;
   for (auto [a, b] : llvm::zip(lhs->target.guards, rhs->target.guards)) {
-    if (a.field != b.field || a.equalsValue != b.equalsValue)
+    if (a.equalsValue != b.equalsValue)
+      return false;
+    bool lhsHasKey = static_cast<bool>(a.key);
+    bool rhsHasKey = static_cast<bool>(b.key);
+    if (lhsHasKey != rhsHasKey)
+      return false;
+    if (lhsHasKey && a.keyHash != b.keyHash)
       return false;
   }
   if (lhs->editSummary.size() != rhs->editSummary.size())
     return false;
   for (auto [a, b] : llvm::zip(lhs->editSummary, rhs->editSummary)) {
-    if (a.field != b.field || a.valueHash != b.valueHash)
+    if (a.keyHash != b.keyHash || a.valueHash != b.valueHash)
       return false;
   }
   return true;
@@ -350,6 +357,13 @@ static llvm::hash_code hashValueExpr(Value value,
   return h;
 }
 
+static llvm::hash_code hashOptionalValue(Value value,
+                                         DenseMap<Value, llvm::hash_code> &cache) {
+  if (!value)
+    return llvm::hash_value(static_cast<void *>(nullptr));
+  return hashValueExpr(value, cache);
+}
+
 // token edits supported only clone and set ops
 // get ops didn't change the token, so they are ignored
 static LogicalResult summarizeTokenEdits(
@@ -363,8 +377,10 @@ static LogicalResult summarizeTokenEdits(
   if (auto set = dyn_cast<TokenSetOp>(def)) {
     if (failed(summarizeTokenEdits(set.getToken(), source, edits, hashCache)))
       return failure();
-    edits.push_back(TokenEditSignature{
-        set.getFieldAttr(), hashValueExpr(set.getValue(), hashCache)});
+    TokenEditSignature sig;
+    sig.keyHash = hashValueExpr(set.getKey(), hashCache);
+    sig.valueHash = hashValueExpr(set.getValue(), hashCache);
+    edits.push_back(std::move(sig));
     return success();
   }
   if (auto clone = dyn_cast<TokenCloneOp>(def))
@@ -392,16 +408,20 @@ static std::optional<int64_t> getConstI64(Value value) {
 /// Attempt to infer a metadata guard for a place_list slot.
 static std::optional<TokenGuard> matchListIndexGuard(Value index,
                                                      int64_t slot) {
+  DenseMap<Value, llvm::hash_code> guardHashCache;
   Value current = stripIndexCasts(index);
-
-  if (auto get = current.getDefiningOp<TokenGetOp>())
-    return TokenGuard{get.getFieldAttr(), slot};
 
   auto buildGuard = [&](TokenGetOp get, int64_t offset,
                         bool add) -> std::optional<TokenGuard> {
-    int64_t base = add ? slot - offset : slot + offset;
-    return TokenGuard{get.getFieldAttr(), base};
+    TokenGuard guard;
+    guard.key = get.getKey();
+    guard.keyHash = hashValueExpr(guard.key, guardHashCache);
+    guard.equalsValue = add ? slot - offset : slot + offset;
+    return guard;
   };
+
+  if (auto get = current.getDefiningOp<TokenGetOp>())
+    return buildGuard(get, /*offset=*/0, /*add=*/true);
 
   if (auto subi = current.getDefiningOp<arith::SubIOp>()) {
     if (auto lhs = subi.getLhs().getDefiningOp<TokenGetOp>())
@@ -421,8 +441,12 @@ static std::optional<TokenGuard> matchListIndexGuard(Value index,
         return buildGuard(rhs, *lhsConst, /*add=*/true);
   }
 
-  if (auto constIdx = getConstI64(current))
-    return TokenGuard{StringAttr{}, constIdx.value()};
+  if (auto constIdx = getConstI64(current)) {
+    TokenGuard guard;
+    guard.equalsValue = constIdx.value();
+    guard.keyHash = hashOptionalValue(Value(), guardHashCache);
+    return guard;
+  }
 
   return std::nullopt;
 }
@@ -459,7 +483,7 @@ static LogicalResult resolveEmitTargets(Value placeValue,
       TargetInfo info;
       info.symbol = sym.getAttr();
       if (auto guard = matchListIndexGuard(get.getIndex(), slot))
-        if (guard->field)
+        if (guard->key)
           info.guards.push_back(*guard);
       targets.push_back(std::move(info));
     }
@@ -533,15 +557,21 @@ static Value cloneValueInto(Value value, IRMapping &mapping,
 }
 
 static Value buildGuardCondition(const SmallVectorImpl<TokenGuard> &guards,
-                                 Value token, ImplicitLocOpBuilder &builder) {
+                                 const EdgeTemplate &templ, Value token,
+                                 ImplicitLocOpBuilder &builder) {
   if (guards.empty())
     return {};
   auto i64Ty = IntegerType::get(builder.getContext(), 64);
+  IRMapping mapping;
+  mapping.map(templ.takeValue, token);
   Value condition;
   for (const TokenGuard &guard : guards) {
-    if (!guard.field)
+    if (!guard.key)
       continue;
-    Value lhs = builder.create<TokenGetOp>(i64Ty, token, guard.field);
+    Value keyValue = cloneValueInto(guard.key, mapping, builder);
+    if (!keyValue)
+      return {};
+    Value lhs = builder.create<TokenGetOp>(i64Ty, token, keyValue);
     Value rhs = builder.create<arith::ConstantOp>(
         builder.getI64IntegerAttr(guard.equalsValue));
     Value eq = builder.create<arith::CmpIOp>(arith::CmpIPredicate::eq, lhs, rhs);
@@ -912,7 +942,8 @@ struct LPNRetainObservablesPass
     if (templ->target.guards.empty())
       return emitBody(builder, token, accumulatedDelay);
 
-    Value cond = buildGuardCondition(templ->target.guards, token, builder);
+    Value cond =
+        buildGuardCondition(templ->target.guards, *templ, token, builder);
     if (!cond)
       return builder.getInsertionBlock()->getParentOp()->emitError(
           "failed to build guard condition");
