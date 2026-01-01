@@ -7,12 +7,12 @@ def build_example() -> str:
   p_out = net.place("P_out")
   ctrl = net.place("P_ctrl", initial_tokens=1)
 
-  @net.transition("start")
-  def _(t):
-    ticket = t.take(ctrl)
-    token = t.take(p_in)
-    t.emit(p_out, token)
-    t.emit(ctrl, ticket)
+  @net.jit("start")
+  def start():
+    ticket = take(ctrl)
+    token = take(p_in)
+    emit(p_out, token)
+    emit(ctrl, ticket)
 
   return net.build()
 

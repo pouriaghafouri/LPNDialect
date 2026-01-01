@@ -13,31 +13,31 @@ def build_multi_take_example() -> str:
   merged = net.place("merged", observable=True)
   pump = net.place("pump", initial_tokens=1)
 
-  @net.transition("seed_left")
-  def _(t):
-    ctrl = t.take(pump)
-    token = t.token_create()
-    token = t.token_set(token, "payload", t.const_i64(7))
-    t.emit(left, token)
-    t.emit(pump, ctrl)
+  @net.jit("seed_left")
+  def seed_left():
+    ctrl = take(pump)
+    token = token_create()
+    token = token_set(token, "payload", 7)
+    emit(left, token)
+    emit(pump, ctrl)
 
-  @net.transition("seed_right")
-  def _(t):
-    ctrl = t.take(pump)
-    token = t.token_create()
-    token = t.token_set(token, "payload", t.const_i64(13))
-    t.emit(right, token)
-    t.emit(pump, ctrl)
+  @net.jit("seed_right")
+  def seed_right():
+    ctrl = take(pump)
+    token = token_create()
+    token = token_set(token, "payload", 13)
+    emit(right, token)
+    emit(pump, ctrl)
 
-  @net.transition("merge_tokens")
-  def _(t):
-    token_left = t.take(left)
-    token_right = t.take(right)
-    combined = t.token_set(token_left, "left_payload",
-                           t.token_get(token_left, "payload"))
-    combined = t.token_set(combined, "right_payload",
-                           t.token_get(token_right, "payload"))
-    t.emit(merged, combined)
+  @net.jit("merge_tokens")
+  def merge_tokens():
+    token_left = take(left)
+    token_right = take(right)
+    combined = token_set(token_left, "left_payload",
+                         token_get(token_left, "payload"))
+    combined = token_set(combined, "right_payload",
+                         token_get(token_right, "payload"))
+    emit(merged, combined)
 
   return net.build()
 

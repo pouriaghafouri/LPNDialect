@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 
 class Statement:
@@ -64,6 +67,172 @@ class ForStatement(Statement):
     return "\n".join(lines)
 
 
+class TransitionScriptExecutor:
+  """Very small AST executor that rewrites Python if-statements to scf.if."""
+
+  def __init__(self,
+               fn: Callable[..., None],
+               *,
+               require_builder_arg: bool = True):
+    self.fn = fn
+    self.require_builder_arg = require_builder_arg
+    self.filename = inspect.getsourcefile(fn) or fn.__code__.co_filename
+    if not self.filename:
+      raise ValueError("unable to locate source file for transition script")
+    try:
+      with open(self.filename, "r", encoding="utf-8") as f:
+        file_source = f.read()
+    except OSError as exc:
+      raise ValueError("unable to read transition source") from exc
+
+    module = ast.parse(file_source, filename=self.filename)
+    first_line = fn.__code__.co_firstlineno
+
+    def matches_function(node: ast.FunctionDef) -> bool:
+      deco_lines = len(getattr(node, "decorator_list", []))
+      start_line = node.lineno - deco_lines if deco_lines else node.lineno
+      return start_line <= first_line <= node.lineno
+
+    func_defs = [
+        node for node in ast.walk(module)
+        if isinstance(node, ast.FunctionDef) and node.name == fn.__name__
+        and matches_function(node)
+    ]
+    if not func_defs:
+      func_defs = [
+          node for node in ast.walk(module)
+          if isinstance(node, ast.FunctionDef) and node.name == fn.__name__
+      ]
+    if not func_defs:
+      raise ValueError("transition script could not find the function body")
+    self.func_def = func_defs[0]
+    self.signature = inspect.signature(fn)
+
+  def __call__(self, builder: "TransitionBuilder", *args: Any,
+               **kwargs: Any) -> None:
+    if self.require_builder_arg:
+      try:
+        bound = self.signature.bind_partial(builder, *args, **kwargs)
+      except TypeError as exc:
+        raise TypeError(
+            f"transition script '{self.fn.__name__}' must accept a builder argument"
+        ) from exc
+    else:
+      params = list(self.signature.parameters.values())
+      if params:
+        first = params[0]
+        if (first.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                           inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            and first.default is inspect._empty):
+          raise TypeError(
+              f"jit transition '{self.fn.__name__}' should not declare an explicit builder argument"
+          )
+      bound = self.signature.bind_partial(*args, **kwargs)
+
+    bound.apply_defaults()
+    self.builder = builder
+    self.locals: Dict[str, Any] = dict(bound.arguments)
+    self.locals.setdefault("builder", builder)
+    closure_vars = inspect.getclosurevars(self.fn)
+    self.locals.update(closure_vars.nonlocals)
+    for attr in dir(builder):
+      if attr.startswith("_"):
+        continue
+      value = getattr(builder, attr)
+      if callable(value) and attr not in self.locals:
+        self.locals[attr] = value
+    self.globals: Dict[str, Any] = dict(self.fn.__globals__)
+    self.globals.setdefault("__builtins__", __builtins__)
+    self._exec_block(self.func_def.body)
+
+  def _exec_block(self, statements: List[ast.stmt]) -> None:
+    for stmt in statements:
+      self._exec_stmt(stmt)
+
+  def _exec_stmt(self, stmt: ast.stmt) -> None:
+    if isinstance(stmt, ast.If):
+      self._exec_if(stmt)
+      return
+    if isinstance(stmt, ast.For) and self._is_range_loop(stmt):
+      self._exec_range_loop(stmt)
+      return
+    mod = ast.Module(body=[stmt], type_ignores=[])
+    ast.fix_missing_locations(mod)
+    code = compile(mod, self.filename, "exec")
+    exec(code, self.globals, self.locals)
+
+  def _eval_expr(self, expr: ast.expr) -> Any:
+    node = ast.Expression(expr)
+    ast.fix_missing_locations(node)
+    code = compile(node, self.filename, "eval")
+    return eval(code, self.globals, self.locals)
+
+  def _exec_branch(self, statements: List[ast.stmt]) -> None:
+    saved_locals = self.locals
+    branch_locals = dict(saved_locals)
+    self.locals = branch_locals
+    try:
+      self._exec_block(statements)
+    finally:
+      self.locals = saved_locals
+
+  def _exec_if(self, node: ast.If) -> None:
+    cond_value = self._eval_expr(node.test)
+    if not isinstance(cond_value, Value):
+      raise TypeError("transition conditions must evaluate to LPN SSA values")
+
+    def then_fn(_builder: "TransitionBuilder") -> None:
+      self._exec_branch(node.body)
+
+    def else_fn(_builder: "TransitionBuilder") -> None:
+      self._exec_branch(node.orelse)
+
+    false_fn = else_fn if node.orelse else None
+    self.builder.if_op(cond_value, then_fn, false_fn)
+
+  def _is_range_loop(self, node: ast.For) -> bool:
+    call = node.iter
+    return isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "range"
+
+  def _exec_range_loop(self, node: ast.For) -> None:
+    if node.orelse:
+      raise TypeError("lpn jit for-loops do not support 'else' blocks")
+    if not isinstance(node.target, ast.Name):
+      raise TypeError("for-loop target must be a simple variable name")
+    call = node.iter
+    if call.keywords:
+      raise TypeError("range(...) with keyword arguments is not supported")
+    arg_count = len(call.args)
+    if arg_count == 1:
+      lower = 0
+      upper = self._eval_expr(call.args[0])
+      step = 1
+    elif arg_count == 2:
+      lower = self._eval_expr(call.args[0])
+      upper = self._eval_expr(call.args[1])
+      step = 1
+    elif arg_count == 3:
+      lower = self._eval_expr(call.args[0])
+      upper = self._eval_expr(call.args[1])
+      step = self._eval_expr(call.args[2])
+      if isinstance(step, int) and step == 0:
+        raise ValueError("range() step cannot be zero in jit loops")
+    else:
+      raise TypeError("range() expects 1-3 positional arguments in jit loops")
+
+    def loop_body(_builder: "TransitionBuilder", iv_value: Value) -> None:
+      saved_locals = self.locals
+      loop_locals = dict(saved_locals)
+      loop_locals[node.target.id] = iv_value
+      self.locals = loop_locals
+      try:
+        self._exec_block(node.body)
+      finally:
+        self.locals = saved_locals
+
+    self.builder.for_range(lower, upper, step=step, body=loop_body)
+
+
 @dataclass(frozen=True)
 class Value:
   builder: "TransitionBuilder"
@@ -79,6 +248,14 @@ class Value:
   def _require_numeric(self) -> None:
     if self.typ not in ("i64", "f64"):
       raise TypeError(f"operation not supported on values of type {self.typ}")
+
+  def _require_integer_like(self) -> None:
+    if self.typ not in ("i64", "index"):
+      raise TypeError("comparison is only defined on integer/index values")
+
+  def _cmp_int(self, predicate: str, other: Union["Value", int]) -> "Value":
+    self._require_integer_like()
+    return self.builder.cmpi(predicate, self, other, typ=self.typ)
 
   def __add__(self, other: Union["Value", int, float]) -> "Value":
     self._require_numeric()
@@ -97,15 +274,33 @@ class Value:
       raise TypeError("division only supported for f64 values")
     return self.builder.divf(self, other)
 
+  def __eq__(self, other: object) -> "Value":  # type: ignore[override]
+    if isinstance(other, (Value, int)):
+      return self._cmp_int("eq", other)
+    return NotImplemented
+
+  def __ne__(self, other: object) -> "Value":  # type: ignore[override]
+    if isinstance(other, (Value, int)):
+      return self._cmp_int("ne", other)
+    return NotImplemented
+
+  def __lt__(self, other: Union["Value", int]) -> "Value":
+    return self._cmp_int("slt", other)
+
+  def __le__(self, other: Union["Value", int]) -> "Value":
+    return self._cmp_int("sle", other)
+
+  def __gt__(self, other: Union["Value", int]) -> "Value":
+    return self._cmp_int("sgt", other)
+
+  def __ge__(self, other: Union["Value", int]) -> "Value":
+    return self._cmp_int("sge", other)
+
   def eq(self, other: Union["Value", int, float]) -> "Value":
-    if self.typ not in ("i64", "index"):
-      raise TypeError("eq is only defined on integer/index values")
-    return self.builder.cmpi("eq", self, other, typ=self.typ)
+    return self.__eq__(other)
 
   def ne(self, other: Union["Value", int, float]) -> "Value":
-    if self.typ not in ("i64", "index"):
-      raise TypeError("ne is only defined on integer/index values")
-    return self.builder.cmpi("ne", self, other, typ=self.typ)
+    return self.__ne__(other)
 
 
 @dataclass(frozen=True)
@@ -567,13 +762,30 @@ class NetBuilder:
     self._places.append((handle, capacity, initial_tokens, observable))
     return handle
 
-  def transition(self, name: str) -> Callable[[Callable[[TransitionBuilder], None]], Callable[[TransitionBuilder], None]]:
+  def transition(self,
+                 name: str,
+                 *,
+                 script: bool = False,
+                 jit: bool = False
+                 ) -> Callable[[Callable[[TransitionBuilder], None]], Callable[[TransitionBuilder], None]]:
+    if jit:
+      script = True
+
     def decorator(fn: Callable[[TransitionBuilder], None]):
       builder = TransitionBuilder(name)
-      fn(builder)
+      if script:
+        executor = TransitionScriptExecutor(
+            fn, require_builder_arg=not jit)
+        executor(builder)
+      else:
+        fn(builder)
       self._transitions.append(builder)
       return fn
     return decorator
+
+  def jit(self, name: str):
+    """Convenience decorator mirroring Triton-style @jit syntax."""
+    return self.transition(name, script=True, jit=True)
 
   def build(self) -> str:
     lines = ["module {", "  lpn.net {"]

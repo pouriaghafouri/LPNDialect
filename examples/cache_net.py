@@ -22,67 +22,54 @@ def build_cache_example(addresses: Iterable[int]) -> str:
   state_seed = net.place("state_seed", initial_tokens=1)
   issue_ctrl = net.place("issue_ctrl", initial_tokens=1)
 
-  @net.transition("cpu_issue")
-  def _(t, trace=list(addresses), req=l1_req, ctrl=issue_ctrl):
-    t.take(ctrl)
-    for seq, addr in enumerate(trace):
+  @net.jit("cpu_issue")
+  def cpu_issue(trace=list(addresses)):
+    take(issue_ctrl)
+    for seq_addr in enumerate(trace):
+      seq, addr = seq_addr
       line = (addr // LINE_BYTES) % NUM_LINES
-      token = t.token_create()
-      token = t.token_set(token, "addr", t.const_i64(addr))
-      token = t.token_set(token, "line", t.const_i64(line))
-      token = t.token_set(token, "seq", t.const_i64(seq))
-      t.emit(req, token)
+      token = token_create()
+      token = token_set(token, "addr", addr)
+      token = token_set(token, "line", line)
+      token = token_set(token, "seq", seq)
+      emit(l1_req, token)
 
-  @net.transition("init_state")
-  def _(t, seed=state_seed, state_place=l1_state):
-    t.take(seed)
-    state = t.token_create()
+  @net.jit("init_state")
+  def init_state():
+    take(state_seed)
+    state = token_create()
     for idx in range(NUM_LINES):
-      state = t.token_set(state, f"line{idx}", t.const_i64(0))
-    t.emit(state_place, state)
+      state = token_set(state, f"line{idx}", 0)
+    emit(l1_state, state)
 
-  def read_line_flag(builder, token, line_idx):
-    return builder.token_get(token, ("line", line_idx))
+  @net.jit("l1_controller")
+  def l1_controller():
+    req = take(l1_req)
+    state = take(l1_state)
+    line_idx = token_get(req, "line")
+    line_valid = token_get(state, ("line", line_idx))
+    has_line = line_valid != 0
 
-  def write_line_flag(builder, token, line_idx, new_value):
-    return builder.token_set(token, ("line", line_idx), new_value)
+    if has_line:
+      emit(l1_resp, req, delay=L1_HIT_DELAY_NS)
+      emit(l1_state, state)
+    else:
+      emit(l2_req, req)
+      emit(l1_state, state)
 
-  @net.transition("l1_controller")
-  def _(t):
-    req = t.take(l1_req)
-    state = t.take(l1_state)
-    line_idx = t.token_get(req, "line")
-    line_valid = read_line_flag(t, state, line_idx)
-    has_line = t.cmpi("ne", line_valid, t.const_i64(0))
-    t.materialize_place(l1_resp)
-    t.materialize_place(l2_req)
+  @net.jit("l2_forward")
+  def l2_forward():
+    req = take(l2_req)
+    emit(l2_resp, req, delay=L2_DELAY_NS)
 
-    def serve_hit(b):
-      delay = b.const_f64(L1_HIT_DELAY_NS)
-      b.emit(l1_resp, req, delay=delay)
-      b.emit(l1_state, state)
-
-    def serve_miss(b):
-      b.emit(l2_req, req)
-      b.emit(l1_state, state)
-
-    t.if_op(has_line, serve_hit, serve_miss)
-
-  @net.transition("l2_forward")
-  def _(t):
-    req = t.take(l2_req)
-    delay = t.const_f64(L2_DELAY_NS)
-    t.emit(l2_resp, req, delay=delay)
-
-  @net.transition("l1_fill")
-  def _(t):
-    resp = t.take(l2_resp)
-    state = t.take(l1_state)
-    line_idx = t.token_get(resp, "line")
-    updated = write_line_flag(t, state, line_idx, t.const_i64(1))
-    delay = t.const_f64(L1_HIT_DELAY_NS)
-    t.emit(l1_resp, resp, delay=delay)
-    t.emit(l1_state, updated)
+  @net.jit("l1_fill")
+  def l1_fill():
+    resp = take(l2_resp)
+    state = take(l1_state)
+    line_idx = token_get(resp, "line")
+    updated = token_set(state, ("line", line_idx), 1)
+    emit(l1_resp, resp, delay=L1_HIT_DELAY_NS)
+    emit(l1_state, updated)
 
   return net.build()
 

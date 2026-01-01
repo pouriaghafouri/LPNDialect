@@ -14,39 +14,32 @@ def build_split_merge_example() -> str:
   intermediate = net.place("chunks")
   bookkeeping = net.place("bookkeeping")
 
-  @net.transition("split_packets")
-  def _(t):
-    req = t.take(incoming)
-    size = t.token_get(req, "size")
-    chunk_size = t.i64(CHUNK_BYTES)
-    chunk_count = t.divi(size, chunk_size)
-    tracker = req.clone()
-    tracker = t.token_set(tracker, "chunks", chunk_count)
-    t.emit(bookkeeping, tracker)
+  @net.jit("split_packets")
+  def split_packets():
+    req = take(incoming)
+    size = token_get(req, "size")
+    chunk_count = divi(size, CHUNK_BYTES)
+    tracker = token_set(req.clone(), "chunks", chunk_count)
+    emit(bookkeeping, tracker)
 
-    trip_count = t.index_cast(chunk_count, src_type="i64", dst_type="index")
-    zero = t.index(0)
+    trip_count = index_cast(chunk_count, src_type="i64")
 
-    def emit_chunk(tb, iv):
+    for iv in range(trip_count):
       chunk = req.clone()
-      idx_i64 = tb.index_cast(iv, src_type="index", dst_type="i64")
-      chunk = tb.token_set(chunk, "chunk_idx", idx_i64)
-      tb.emit(intermediate, chunk)
+      idx_i64 = index_cast(iv, src_type="index", dst_type="i64")
+      chunk = token_set(chunk, "chunk_idx", idx_i64)
+      emit(intermediate, chunk)
 
-    t.for_range(zero, trip_count, body=emit_chunk)
+  @net.jit("merge_packets")
+  def merge_packets():
+    tracker = take(bookkeeping)
+    chunk_count = token_get(tracker, "chunks")
+    trip_count = index_cast(chunk_count, src_type="i64")
 
-  @net.transition("merge_packets")
-  def _(t):
-    tracker = t.take(bookkeeping)
-    chunk_count = t.token_get(tracker, "chunks")
-    trip_count = t.index_cast(chunk_count, src_type="i64", dst_type="index")
-    zero = t.index(0)
+    for _ in range(trip_count):
+      take(intermediate)
 
-    def drain(tb, iv):
-      tb.take(intermediate)
-
-    t.for_range(zero, trip_count, body=drain)
-    t.emit(outgoing, tracker)
+    emit(outgoing, tracker)
 
   return net.build()
 
