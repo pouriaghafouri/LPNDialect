@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+# Placeholders for injected names
+create = None
+emit = None
+take = None
+builder = None
+
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -9,6 +15,7 @@ from typing import List, Union, Tuple, Optional
 
 from lpnlang_mlir import NetBuilder, PlaceHandle, Value
 from examples.protoacc_helpers import CstStr, ProtoaccWorkload, load_workload
+from examples.protoacc_weight_funcs import register_protoacc_weight_funcs
 
 DEFAULT_WORKLOAD_PATH = Path.home(
 ) / "lpn-dev" / "lpn_examples" / "protoacc" / "hyperprotobench_processed" / "bench0-ser.json"
@@ -38,21 +45,11 @@ def _make_end_token(descriptor):
   return token
 
 
-def take_all_tokens(builder, place, count):
+def pass_all_tokens(src, dst, count):
   if isinstance(count, int):
     for _ in range(count):
-      builder.take(place)
-  else:
-    def loop_body(b, iv):
-      b.take(place)
-    builder.for_range(0, count, step=1, body=loop_body)
-
-
-def pass_all_tokens(builder, src, dst, count):
-  if isinstance(count, int):
-    for _ in range(count):
-      token = builder.take(src)
-      builder.emit(dst, token)
+      token = take(src)
+      emit(dst, token)
   else:
     def loop_body(b, iv):
       token = b.take(src)
@@ -127,6 +124,13 @@ class FieldHandler:
     self.mem_port = (put_p, get_p, fifo_order_p, port_num)
 
   def build_transitions(self) -> None:
+    helpers = register_protoacc_weight_funcs(self.net)
+    pass_field_end_token = helpers.pass_field_end_token
+    pass_key_outputQ_end_of_toplevel_token = helpers.pass_key_outputQ_end_of_toplevel_token
+    pass_non_field_end_token = helpers.pass_non_field_end_token
+    pass_write_hold_cond = helpers.pass_write_hold_cond
+    pass_write_index_holder_cond = helpers.pass_write_index_holder_cond
+
     # tdispatch: ptofieldhandler_dispatcher, pdispatch_index_holder_, pfields -> ...
     @self.net.transition(f"{self.name}_dispatch")
     def tdispatch(ptofieldhandler_dispatcher=self.ptofieldhandler_dispatcher,
@@ -136,153 +140,102 @@ class FieldHandler:
                   pops_in_=self.pops_in_,
                   p_units=self.p_units,
                   p_num_units=self.p_num_units):
-        meta = take(ptofieldhandler_dispatcher)
+        token = take(ptofieldhandler_dispatcher)
         take(pdispatch_index_holder_)
+        num = helpers.take_num_field_tokens(token)
         
-        num = meta.get("num")
+        token_array = helpers.take_all_tokens(pfields, num)
         
-        emit(pops_in_, meta.clone()) 
-        
-        pass_all_tokens(builder, pfields, p_units, num)
-             
         emit(pdispatch_hold, create())
+        emit(pops_in_, token)
         
-        num_token = create().set("num", num)
-        emit(p_num_units, num_token)
+        for i in range(num):
+          emit(p_units, token_array[i])
+        
+        emit(p_num_units, create().set("num", num))
 
     # t_resume: p_num_units, p_finished -> p_S_WAIT_CMD, p_outputQ
     @self.net.transition(f"{self.name}_resume")
-    def t_resume(p_num_units=self.p_num_units,
-                 p_finished=self.p_finished,
-                 p_S_WAIT_CMD=self.p_S_WAIT_CMD,
-                 p_outputQ=self.p_outputQ):
-        num_token = take(p_num_units)
-        num = num_token.get("num")
+    def t_resume():
+        token = take(self.p_num_units)
+        num = helpers.take_resume_token(token)
+        helpers.take_all_tokens(self.p_finished, num)
         
-        take_all_tokens(builder, p_finished, num)
-        
-        emit(p_S_WAIT_CMD, create())
-        
-        # pass_field_end_token
-        end_token = create().set("bytes", 0).set("end_of_field", 1).set("end_of_top_level", 0)
-        emit(p_outputQ, end_token)
+        helpers.pass_empty_token(self.p_S_WAIT_CMD)
+        helpers.pass_field_end_token(self.p_outputQ)
 
     # t_dist: pops_in_, p_dist_hold -> split
     @self.net.transition(f"{self.name}_dist")
-    def t_dist(pops_in_=self.pops_in_,
-               p_dist_hold=self.p_dist_hold,
-               pops_in__eom=self.pops_in__eom,
-               pops_in__scalar=self.pops_in__scalar,
-               pops_in__non_scalar=self.pops_in__non_scalar,
-               pops_in__repeated=self.pops_in__repeated):
-        token = take(pops_in_)
-        take(p_dist_hold)
+    def t_dist():
+        take(self.pops_in_)
+        take(self.p_dist_hold)
         
-        type_val = token.get("type")
-        repeated = token.get("repeated")
-        
-        if repeated == 1:
-             emit(pops_in__repeated, token)
-        elif type_val == 0: # SCALAR
-             emit(pops_in__scalar, token)
-        elif type_val == 1: # NONSCALAR
-             emit(pops_in__non_scalar, token)
-        elif type_val == 3: # EOM
-             emit(pops_in__eom, token)
-        elif type_val == 4: # EOM_TOP
-             emit(pops_in__eom, token)
+        helpers.pass_eom(self.pops_in_, self.pops_in__eom)
+        helpers.pass_scalar(self.pops_in_, self.pops_in__scalar)
+        helpers.pass_non_scalar(self.pops_in_, self.pops_in__non_scalar)
+        helpers.pass_repeated(self.pops_in_, self.pops_in__repeated)
 
     # t_eom
     @self.net.transition(f"{self.name}_eom")
-    def t_eom(pops_in__eom=self.pops_in__eom,
-              p_S_WAIT_CMD=self.p_S_WAIT_CMD,
-              p_units=self.p_units,
-              p_outputQ=self.p_outputQ,
-              p_finished=self.p_finished,
-              p_dist_hold=self.p_dist_hold):
-        take(pops_in__eom)
-        take(p_S_WAIT_CMD)
-        take(p_units)
+    def t_eom():
+      take(self.pops_in__eom)
+      take(self.p_S_WAIT_CMD)
+      take(self.p_units)
         
-        # pass_key_outputQ_end_of_toplevel_token
-        token = create().set("end_of_top_level", 1)
-        emit(p_outputQ, token, delay=2.0)
+      helpers.pass_key_outputQ_end_of_toplevel_token(self.pops_in__eom, self.p_outputQ, 2.0)
         
-        emit(p_finished, create())
-        emit(p_dist_hold, create())
+      helpers.pass_empty_token(self.p_finished)
+      helpers.pass_empty_token(self.p_dist_hold)
 
     # t_25 (scalar)
     @self.net.transition(f"{self.name}_t25")
-    def t_25(pops_in__scalar=self.pops_in__scalar,
-             p_S_WAIT_CMD=self.p_S_WAIT_CMD,
-             p_S_SCALAR_DISPATCH_REQ=self.p_S_SCALAR_DISPATCH_REQ,
-             p_dist_hold=self.p_dist_hold):
-        take(pops_in__scalar)
-        take(p_S_WAIT_CMD)
-        emit(p_S_SCALAR_DISPATCH_REQ, create(), delay=1.0)
-        emit(p_dist_hold, create())
+    def t_25():
+        take(self.pops_in__scalar)
+        take(self.p_S_WAIT_CMD)
+        helpers.pass_empty_token(self.p_S_SCALAR_DISPATCH_REQ, 1.0)
+        helpers.pass_empty_token(self.p_dist_hold)
 
     # t_26 (non-scalar)
     @self.net.transition(f"{self.name}_t26")
-    def t_26(pops_in__non_scalar=self.pops_in__non_scalar,
-             p_S_WAIT_CMD=self.p_S_WAIT_CMD,
-             p_S_STRING_GETPTR=self.p_S_STRING_GETPTR,
-             p_dist_hold=self.p_dist_hold):
-        take(pops_in__non_scalar)
-        take(p_S_WAIT_CMD)
-        emit(p_S_STRING_GETPTR, create(), delay=1.0)
-        emit(p_dist_hold, create())
+    def t_26():
+        take(self.pops_in__non_scalar)
+        take(self.p_S_WAIT_CMD)
+        helpers.pass_empty_token(self.p_S_STRING_GETPTR, 1.0)
+        helpers.pass_empty_token(self.p_dist_hold)
 
     # t_28 (repeated)
     @self.net.transition(f"{self.name}_t28")
-    def t_28(pops_in__repeated=self.pops_in__repeated,
-             p_S_WAIT_CMD=self.p_S_WAIT_CMD,
-             p_S_UNPACKED_REP_GETPTR=self.p_S_UNPACKED_REP_GETPTR,
-             p_dist_hold=self.p_dist_hold):
-        token = take(pops_in__repeated)
-        take(p_S_WAIT_CMD)
-        emit(p_S_UNPACKED_REP_GETPTR, token, delay=1.0)
-        emit(p_dist_hold, create())
+    def t_28():
+        take(self.pops_in__repeated)
+        take(self.p_S_WAIT_CMD)
+        helpers.pass_token(self.pops_in__repeated, self.p_S_UNPACKED_REP_GETPTR, 1, 1.0)
+        helpers.pass_empty_token(self.p_dist_hold)
 
     # t_31
     @self.net.transition(f"{self.name}_t31")
-    def t_31(p_S_WRITE_KEY=self.p_S_WRITE_KEY,
-             p_finished=self.p_finished,
-             p_hold=self.p_hold,
-             p_outputQ=self.p_outputQ):
-        take(p_S_WRITE_KEY)
-        emit(p_finished, create(), delay=1.0)
-        emit(p_hold, create())
-        emit(p_outputQ, create())
+    def t_31():
+        take(self.p_S_WRITE_KEY)
+        emit(self.p_finished, create(), delay=1.0)
+        helpers.pass_empty_token(self.p_hold)
+        helpers.pass_key_outputQ_token(self.p_outputQ)
 
     # t_40
     @self.net.transition(f"{self.name}_t40")
-    def t_40(p_S_STRING_WRITE_KEY=self.p_S_STRING_WRITE_KEY,
-             p_finished=self.p_finished,
-             p_outputQ=self.p_outputQ,
-             p_hold=self.p_hold):
-        take(p_S_STRING_WRITE_KEY)
-        emit(p_finished, create(), delay=1.0)
-        emit(p_outputQ, create())
-        emit(p_hold, create())
+    def t_40():
+        take(self.p_S_STRING_WRITE_KEY)
+        emit(self.p_finished, create(), delay=1.0)
+        helpers.pass_key_outputQ_token(self.p_outputQ)
+        helpers.pass_empty_token(self.p_hold)
 
     # t_write_req_out
     @self.net.transition(f"{self.name}_write_req_out")
-    def t_write_req_out(p_outputQ=self.p_outputQ,
-                        pwrite_index_holder_=self.pwrite_index_holder_,
-                        pwrites_input_IF_Q=self.pwrites_input_IF_Q,
-                        pwrite_hold=self.pwrite_hold):
-        token = take(p_outputQ)
-        idx_token = take(pwrite_index_holder_)
+    def t_write_req_out():
+        take(self.p_outputQ)
+        take(self.pwrite_index_holder_)
         
-        end_of_field = token.get("end_of_field")
-        
-        if end_of_field == 0:
-            emit(pwrites_input_IF_Q, token)
-            emit(pwrite_index_holder_, idx_token)
-        else:
-            emit(pwrite_hold, create())
-            # idx_token is consumed (not put back)
+        helpers.pass_non_field_end_token(self.p_outputQ, self.pwrites_input_IF_Q, 1)
+        helpers.pass_write_index_holder_cond(self.p_outputQ, self.pwrite_index_holder_, self.pwrite_index_holder_)
+        helpers.pass_write_hold_cond(self.p_outputQ, self.pwrite_hold)
 
     # Memory transitions
     if self.mem_port:
@@ -297,18 +250,10 @@ class FieldHandler:
                      mem_fifo=fifo_p):
             take(p_S_SCALAR_DISPATCH_REQ)
             take(p_hold)
-            emit(p_t_30_pre, create(), delay=2.0)
+            helpers.pass_empty_token(p_t_30_pre, 2.0)
             
-            req = create()
-            req = req.set("cmd", int(CstStr.SCALAR_DISPATCH_REQ))
-            req = req.set("addr", 0)
-            req = req.set("port", port_num)
-            emit(mem_put, req)
-            
-            order = create()
-            order = order.set("port", port_num)
-            order = order.set("count", 1)
-            emit(mem_fifo, order)
+            helpers.mem_request(mem_put, port_num, CstStr.SCALAR_DISPATCH_REQ, 1)
+            helpers.push_request_order(mem_fifo, port_num, 1)
 
         # t_30_post
         @self.net.transition(f"{self.name}_t30_post")
@@ -320,8 +265,8 @@ class FieldHandler:
             take(p_t_30_pre)
             take(mem_get)
             take(p_units)
-            emit(p_outputQ, create())
-            emit(p_S_WRITE_KEY, create())
+            helpers.pass_scalar_outputQ_token(p_units, p_outputQ)
+            helpers.pass_empty_token(p_S_WRITE_KEY)
 
         # t_36_pre
         @self.net.transition(f"{self.name}_t36_pre")
@@ -332,18 +277,10 @@ class FieldHandler:
                      mem_fifo=fifo_p):
             take(p_S_STRING_GETPTR)
             take(p_hold)
-            emit(p_t_36_pre, create(), delay=4.0)
+            helpers.pass_empty_token(p_t_36_pre, 4.0)
             
-            req = create()
-            req = req.set("cmd", int(CstStr.STRING_GETPTR_REQ))
-            req = req.set("addr", 0)
-            req = req.set("port", port_num)
-            emit(mem_put, req)
-            
-            order = create()
-            order = order.set("port", port_num)
-            order = order.set("count", 1)
-            emit(mem_fifo, order)
+            helpers.mem_request(mem_put, port_num, CstStr.STRING_GETPTR_REQ, 3)
+            helpers.push_request_order(mem_fifo, port_num, 3)
 
         # t_36_post
         @self.net.transition(f"{self.name}_t36_post")
@@ -352,9 +289,10 @@ class FieldHandler:
                       p_units=self.p_units,
                       p_S_STRING_LOADDATA=self.p_S_STRING_LOADDATA):
             take(p_t_36_pre)
-            take(mem_get)
+            helpers.take_some_token(3) # Consumes from mem_get
+            helpers.take_all_tokens(mem_get, 3) # Manual take because take_some_token returns int
             take(p_units)
-            emit(p_S_STRING_LOADDATA, create())
+            helpers.pass_token(p_units, p_S_STRING_LOADDATA, 1)
 
         # t_37_pre
         @self.net.transition(f"{self.name}_t37_pre")
@@ -364,19 +302,11 @@ class FieldHandler:
                      mem_put=put_p,
                      mem_fifo=fifo_p):
             take(p_S_STRING_LOADDATA)
-            emit(p_t_37_pre, create())
-            emit(p_t_37_pre3, create())
+            helpers.pass_16_bytes_outputQ_token(p_S_STRING_LOADDATA, p_t_37_pre)
+            helpers.pass_bytes_token(p_S_STRING_LOADDATA, p_t_37_pre3)
             
-            req = create()
-            req = req.set("cmd", int(CstStr.STRING_LOADDATA_REQ))
-            req = req.set("addr", 0)
-            req = req.set("port", port_num)
-            emit(mem_put, req)
-            
-            order = create()
-            order = order.set("port", port_num)
-            order = order.set("count", 1)
-            emit(mem_fifo, order)
+            helpers.mem_request_v2(p_S_STRING_LOADDATA, mem_put, port_num, CstStr.STRING_LOADDATA_REQ)
+            helpers.push_request_order_v2(p_S_STRING_LOADDATA, mem_fifo, port_num)
 
         # t_37_post
         @self.net.transition(f"{self.name}_t37_post")
@@ -386,17 +316,19 @@ class FieldHandler:
                       p_t_37_pre2=self.p_t_37_pre2):
             take(p_t_37_pre)
             take(mem_get)
-            emit(p_outputQ, create())
-            emit(p_t_37_pre2, create())
+            helpers.pass_token(p_t_37_pre, p_outputQ, 1)
+            helpers.pass_empty_token(p_t_37_pre2)
 
         # t_37_post2
         @self.net.transition(f"{self.name}_t37_post2")
         def t_37_post2(p_t_37_pre3=self.p_t_37_pre3,
                        p_t_37_pre2=self.p_t_37_pre2,
                        p_S_STRING_WRITE_KEY=self.p_S_STRING_WRITE_KEY):
-            take(p_t_37_pre3)
-            take(p_t_37_pre2)
-            emit(p_S_STRING_WRITE_KEY, create())
+            token = take(p_t_37_pre3)
+            num = helpers.get_num_from_token(token)
+            helpers.take_all_tokens(p_t_37_pre2, num)
+            
+            helpers.pass_empty_token(p_S_STRING_WRITE_KEY)
 
         # t_44_pre
         @self.net.transition(f"{self.name}_t44_pre")
@@ -405,18 +337,10 @@ class FieldHandler:
                      mem_put=put_p,
                      mem_fifo=fifo_p):
             take(p_S_UNPACKED_REP_GETPTR)
-            emit(p_t_44_pre, create(), delay=2.0)
+            helpers.pass_token(p_S_UNPACKED_REP_GETPTR, p_t_44_pre, 1, 2.0)
             
-            req = create()
-            req = req.set("cmd", int(CstStr.UNPACKED_REP_GETPTR_REQ))
-            req = req.set("addr", 0)
-            req = req.set("port", port_num)
-            emit(mem_put, req)
-            
-            order = create()
-            order = order.set("port", port_num)
-            order = order.set("count", 1)
-            emit(mem_fifo, order)
+            helpers.mem_request(mem_put, port_num, CstStr.UNPACKED_REP_GETPTR_REQ, 2)
+            helpers.push_request_order(mem_fifo, port_num, 2)
 
         # t_44_post
         @self.net.transition(f"{self.name}_t44_post")
@@ -425,9 +349,11 @@ class FieldHandler:
                       p_S_SCALAR_DISPATCH_REQ=self.p_S_SCALAR_DISPATCH_REQ,
                       p_S_STRING_GETPTR=self.p_S_STRING_GETPTR):
             take(p_t_44_pre)
-            take(mem_get)
-            emit(p_S_SCALAR_DISPATCH_REQ, create())
-            emit(p_S_STRING_GETPTR, create())
+            helpers.take_some_token(2)
+            helpers.take_all_tokens(mem_get, 2)
+            
+            helpers.pass_repeated_array_token(p_t_44_pre, p_S_SCALAR_DISPATCH_REQ, CstStr.SCALAR)
+            helpers.pass_repeated_array_token(p_t_44_pre, p_S_STRING_GETPTR, CstStr.NONSCALAR)
 
 
 class FrontEnd:
@@ -487,69 +413,55 @@ class FrontEnd:
     self.mem_write_port = (put, get, fifo, port_num)
 
   def build_transitions(self):
+    helpers = register_protoacc_weight_funcs(self.net)
+    pass_not_submessage = helpers.pass_not_submessage
+    pass_field_index_add_one = helpers.pass_field_index_add_one
+    pass_token = helpers.pass_token
+    push_request_order = helpers.push_request_order
+    mem_request = helpers.mem_request
+
     # t1: pcontrol -> pdescr_request_Q, pisnot_submessage_value_resp
     @self.net.transition
-    def t1(pcontrol=self.pcontrol, 
-           pdescr_request_Q=self.pdescr_request_Q, 
-           pisnot_submessage_value_resp=self.pisnot_submessage_value_resp):
-        token = take(pcontrol)
-        emit(pdescr_request_Q, token.clone())
-        emit(pisnot_submessage_value_resp, token)
+    def t1():
+        token = take(self.pcontrol)
+        helpers.pass_token(token, self.pdescr_request_Q, 1)
+        helpers.pass_not_submessage(token, self.pisnot_submessage_value_resp)
 
     # t2: pAdvance_OK, pmessage_tasks -> pcontrol
     @self.net.transition
-    def t2(pAdvance_OK=self.pAdvance_OK, 
-           pmessage_tasks=self.pmessage_tasks, 
-           pcontrol=self.pcontrol):
-        take(pAdvance_OK)
-        task = take(pmessage_tasks)
-        emit(pcontrol, task, delay=1.0)
+    def t2():
+        take(self.pAdvance_OK)
+        task = take(self.pmessage_tasks)
+        helpers.pass_token(task, self.pcontrol, 1, 1.0)
 
     # t3_pre: pisnot_submessage_value_resp -> p_t_3_pre, mem_req
     # mem_request(port_num, LOAD_HASBITS_AND_IS_SUBMESSAGE, 2)
     if self.mem_read_ports:
         put_0, get_0, fifo_0, port_num_0 = self.mem_read_ports[0]
-        
+
         @self.net.transition
         def t3_pre(pisnot_submessage_value_resp=self.pisnot_submessage_value_resp,
                    p_t_3_pre=self.p_t_3_pre,
                    mem_put=put_0,
                    mem_fifo=fifo_0):
             token = take(pisnot_submessage_value_resp)
-            emit(p_t_3_pre, token, delay=1.0)
+            helpers.pass_token(token, p_t_3_pre, 1, 1.0)
             
-            # mem_request and push_request_order loop 2 times
-            for i in range(2):
-                req = create()
-                req = req.set("cmd", int(CstStr.LOAD_HASBITS_AND_IS_SUBMESSAGE))
-                req = req.set("addr", 2) # Dummy address
-                req = req.set("port", port_num_0)
-                emit(mem_put, req)
-                
-                order = create()
-                order = order.set("port", port_num_0)
-                order = order.set("count", 1)
-                emit(mem_fifo, order)
+            helpers.push_request_order(mem_fifo, port_num_0, 2)
+            helpers.mem_request(mem_put, port_num_0, CstStr.LOAD_HASBITS_AND_IS_SUBMESSAGE, 2)
 
-        # t3_post: p_t_3_pre, mem_get -> pAdvance_OK, ps_hasBitsLoader_HasBitsLoad
         @self.net.transition
         def t3_post(p_t_3_pre=self.p_t_3_pre,
                     mem_get=get_0,
                     pAdvance_OK=self.pAdvance_OK,
                     ps_hasBitsLoader_HasBitsLoad=self.ps_hasBitsLoader_HasBitsLoad):
             take(p_t_3_pre)
-            # take_some_token(2) from mem_get
-            # In MLIR DSL we take one by one or loop. 
-            # Assuming mem_get provides the response.
-            # The original code says take_some_token(2). 
-            # Let's assume we take 2 tokens.
-            take(mem_get)
-            take(mem_get)
+            helpers.take_some_token(2)
+            helpers.take_all_tokens(mem_get, 2)
             
-            emit(pAdvance_OK, create())
-            emit(ps_hasBitsLoader_HasBitsLoad, create())
+            helpers.pass_empty_token(pAdvance_OK)
+            helpers.pass_empty_token(ps_hasBitsLoader_HasBitsLoad)
 
-        # t9_pre: p9_descr, psWaitForRequest -> p_t_9_pre, mem_req
         @self.net.transition
         def t9_pre(p9_descr=self.p9_descr,
                    psWaitForRequest=self.psWaitForRequest,
@@ -558,21 +470,11 @@ class FrontEnd:
                    mem_fifo=fifo_0):
             take(p9_descr)
             take(psWaitForRequest)
-            emit(p_t_9_pre, create())
-            
-            for i in range(2):
-                req = create()
-                req = req.set("cmd", int(CstStr.LOAD_NEW_SUBMESSAGE))
-                req = req.set("addr", 2)
-                req = req.set("port", port_num_0)
-                emit(mem_put, req)
-                
-                order = create()
-                order = order.set("port", port_num_0)
-                order = order.set("count", 1)
-                emit(mem_fifo, order)
+            helpers.pass_empty_token(p_t_9_pre)
 
-        # t9_post: p_t_9_pre, mem_get -> psWaitForRequest, pAdvance_OK, pholder_split_msg
+            helpers.mem_request(mem_put, port_num_0, CstStr.LOAD_NEW_SUBMESSAGE, 2)
+            helpers.push_request_order(mem_fifo, port_num_0, 2)
+
         @self.net.transition
         def t9_post(p_t_9_pre=self.p_t_9_pre,
                     mem_get=get_0,
@@ -580,12 +482,12 @@ class FrontEnd:
                     pAdvance_OK=self.pAdvance_OK,
                     pholder_split_msg=self.pholder_split_msg):
             take(p_t_9_pre)
-            take(mem_get)
-            take(mem_get)
-            
-            emit(psWaitForRequest, create())
-            emit(pAdvance_OK, create())
-            emit(pholder_split_msg, create())
+            helpers.take_some_token(2)
+            helpers.take_all_tokens(mem_get, 2)
+
+            helpers.pass_empty_token(psWaitForRequest)
+            helpers.pass_empty_token(pAdvance_OK)
+            helpers.pass_empty_token(pholder_split_msg)
 
     # tload_field_addr: p10_descr_pre, ps_hasBitsLoader_HasBitsLoad, pfields_meta -> ...
     if len(self.mem_read_ports) > 1:
@@ -602,23 +504,13 @@ class FrontEnd:
             ctrl = take(p10_descr_pre)
             take(ps_hasBitsLoader_HasBitsLoad)
             
-            count = ctrl.get("control_range")
-            emit(p10_descr_post3, ctrl.clone())
+            count = helpers.take_num_field_as_control(ctrl)
+            helpers.anonymous_func_1_pass_token(ctrl, p10_descr_post3)
             
-            for i in range(count):
-                meta = take(pfields_meta)
-                emit(p10_descr_post, meta)
-                
-                req = create()
-                req = req.set("cmd", int(CstStr.LOAD_EACH_FIELD))
-                req = req.set("addr", 0)
-                req = req.set("port", port_num_1)
-                emit(mem_put, req)
-                
-                order = create()
-                order = order.set("port", port_num_1)
-                order = order.set("count", 1)
-                emit(mem_fifo, order)
+            pass_all_tokens(pfields_meta, p10_descr_post, count)
+            
+            helpers.mem_request_v3(ctrl, mem_put, port_num_1, CstStr.LOAD_EACH_FIELD)
+            helpers.push_request_order_v3(ctrl, mem_fifo, port_num_1)
 
         # tload_field_addr_post
         @self.net.transition
@@ -629,68 +521,49 @@ class FrontEnd:
             meta = take(p10_descr_post)
             take(mem_get)
             
-            emit(ptofieldhandler_dispatcher, meta, delay=2.0)
-            emit(p10_descr_post2, create())
+            helpers.pass_token(meta, ptofieldhandler_dispatcher, 1, 2.0)
+            helpers.pass_empty_token(p10_descr_post2)
 
     # t10: p10_descr_post3, p10_descr_post2 -> pholder_split_msg
     @self.net.transition
-    def t10(p10_descr_post3=self.p10_descr_post3,
-            p10_descr_post2=self.p10_descr_post2,
-            pholder_split_msg=self.pholder_split_msg):
-        ctrl = take(p10_descr_post3)
-        count = ctrl.get("control_range")
+    def t10():
+        ctrl = take(self.p10_descr_post3)
+        count = helpers.get_num_from_token(ctrl)
         
-        take_all_tokens(builder, p10_descr_post2, count)
+        helpers.take_all_tokens(self.p10_descr_post2, count)
         
-        emit(pholder_split_msg, create())
+        helpers.pass_empty_token(self.pholder_split_msg)
 
     # tsplit_msg: pdescr_request_Q, pholder_split_msg -> p10_descr_pre, p9_descr
     @self.net.transition
-    def tsplit_msg(pdescr_request_Q=self.pdescr_request_Q,
-                   pholder_split_msg=self.pholder_split_msg,
-                   p10_descr_pre=self.p10_descr_pre,
-                   p9_descr=self.p9_descr):
-        req = take(pdescr_request_Q)
-        take(pholder_split_msg)
+    def tsplit_msg():
+        req = take(self.pdescr_request_Q)
+        take(self.pholder_split_msg)
         
-        type_val = req.get("type")
-        if type_val == 2: # SUBMESSAGE
-            emit(p9_descr, req)
-        else:
-            emit(p10_descr_pre, req)
+        helpers.pass_message_token(req, self.p9_descr)
+        helpers.pass_non_message_token(req, self.p10_descr_pre)
 
     # t19: pwrites_input_IF_Q -> pwrites_inject_Q
     @self.net.transition
-    def t19(pwrites_input_IF_Q=self.pwrites_input_IF_Q,
-            pwrites_inject_Q=self.pwrites_inject_Q):
-        token = take(pwrites_input_IF_Q)
-        emit(pwrites_inject_Q, token, delay=1.0)
+    def t19():
+        token = take(self.pwrites_input_IF_Q)
+        helpers.pass_token(token, self.pwrites_inject_Q, 1, 1.0)
 
     # tdist: pwrites_inject_Q, phold -> pwrites_inject_Q_non_top, pwrites_inject_Q_top
     @self.net.transition
-    def tdist(pwrites_inject_Q=self.pwrites_inject_Q,
-              phold=self.phold,
-              pwrites_inject_Q_non_top=self.pwrites_inject_Q_non_top,
-              pwrites_inject_Q_top=self.pwrites_inject_Q_top):
-        token = take(pwrites_inject_Q)
-        take(phold)
+    def tdist():
+        token = take(self.pwrites_inject_Q)
+        take(self.phold)
         
-        # Check if top level
-        is_top = token.get("end_of_top_level")
-        
-        if is_top:
-            emit(pwrites_inject_Q_top, token)
-        else:
-            emit(pwrites_inject_Q_non_top, token)
+        helpers.pass_top_token(token, self.pwrites_inject_Q_top)
+        helpers.pass_non_top_token(token, self.pwrites_inject_Q_non_top)
 
     # t24: pwrites_inject_Q_top -> pwrite_mem_resp, phold
     @self.net.transition
-    def t24(pwrites_inject_Q_top=self.pwrites_inject_Q_top,
-            pwrite_mem_resp=self.pwrite_mem_resp,
-            phold=self.phold):
-        take(pwrites_inject_Q_top)
-        emit(pwrite_mem_resp, create(), delay=4.0)
-        emit(phold, create())
+    def t24():
+        take(self.pwrites_inject_Q_top)
+        helpers.pass_empty_token(self.pwrite_mem_resp, 4.0)
+        helpers.pass_empty_token(self.phold)
 
     # t23_pre: pwrites_inject_Q_non_top -> p_t_23, mem_req
     if self.mem_write_port:
@@ -702,74 +575,39 @@ class FrontEnd:
                     mem_put=w_put,
                     mem_fifo=w_fifo):
             token = take(pwrites_inject_Q_non_top)
-            emit(p_t_23, token)
+            helpers.pass_empty_token(p_t_23)
             
-            req = create()
-            req = req.set("cmd", int(CstStr.WRITE_OUT))
-            req = req.set("addr", 0)
-            req = req.set("port", w_port)
-            req = req.set("data", token.get("bytes"))
-            emit(mem_put, req)
-            
-            order = create()
-            order = order.set("port", w_port)
-            emit(mem_fifo, order)
+            helpers.mem_request_write_v4(token, mem_put, w_port, CstStr.WRITE_OUT)
+            helpers.push_write_request_order_v4(token, mem_fifo, w_port)
 
         @self.net.transition
         def t23_post(p_t_23=self.p_t_23,
                      phold=self.phold):
             take(p_t_23)
-            emit(phold, create())
+            helpers.pass_empty_token(phold)
 
     handler_targets = [self.handlers[idx] for idx in range(1, self.num_handlers + 1)]
 
     @self.net.transition(f"{self.name}_tdispatch_dist")
-    def tdispatch_dist(pdispatch_index_holder=self.pdispatch_index_holder,
-                       pdispatch_hold=self.pdispatch_hold):
-        idx_token = take(pdispatch_index_holder)
-        take(pdispatch_hold)
-        
-        current_idx = idx_token.get("field_index")
-        next_idx = (current_idx % self.num_handlers) + 1
-            
-        emit(pdispatch_index_holder, idx_token.set("field_index", next_idx))
-        
-        places = [h.pdispatch_index_holder_ for h in handler_targets]
-        targets = array(*places)
-        
-        for i in range(self.num_handlers):
-            # i is index type, cast to i64 for comparison
-            i_i64 = index_cast(i, src_type="index", dst_type="i64")
-            handler_idx = i_i64 + 1
-            
-            target = targets[i]
-            
-            if current_idx == handler_idx:
-                emit(target, idx_token.clone())
+    def tdispatch_dist():
+      idx_token = take(self.pdispatch_index_holder)
+      take(self.pdispatch_hold)
+      next_token = helpers.pass_field_index_add_one(idx_token, self.num_handlers)
+      emit(self.pdispatch_index_holder, next_token)
+      
+      for idx, handler in self.handlers.items():
+          helpers.pass_field_index_token(idx_token, handler.pdispatch_index_holder_, idx)
 
     @self.net.transition(f"{self.name}_twrite_dist")
-    def twrite_dist(pwrite_index_holder=self.pwrite_index_holder,
-                    pwrite_hold=self.pwrite_hold):
-        idx_token = take(pwrite_index_holder)
-        take(pwrite_hold)
+    def twrite_dist():
+      idx_token = take(self.pwrite_index_holder)
+      take(self.pwrite_hold)
+      next_token = helpers.pass_field_index_add_one(idx_token, self.num_handlers)
+      emit(self.pwrite_index_holder, next_token)
+      
+      for idx, handler in self.handlers.items():
+          helpers.pass_field_index_token(idx_token, handler.pwrite_index_holder_, idx)
         
-        current_idx = idx_token.get("field_index")
-        next_idx = (current_idx % self.num_handlers) + 1
-            
-        emit(pwrite_index_holder, idx_token.set("field_index", next_idx))
-        
-        places = [h.pwrite_index_holder_ for h in handler_targets]
-        targets = array(*places)
-        
-        for i in range(self.num_handlers):
-            # i is index type, cast to i64 for comparison
-            i_i64 = index_cast(i, src_type="index", dst_type="i64")
-            handler_idx = i_i64 + 1
-            
-            target = targets[i]
-            
-            if current_idx == handler_idx:
-                emit(target, idx_token.clone())
 
 def build_protoacc_net(workload: ProtoaccWorkload,
                        *,

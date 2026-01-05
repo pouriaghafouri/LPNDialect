@@ -11,7 +11,7 @@ import sys
 import textwrap
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union, get_args, get_origin
 
 
 _AST_OP_MAP = {
@@ -123,19 +123,45 @@ class IfStatement(Statement):
 
 class ForStatement(Statement):
   def __init__(self, iv: str, lower: str, upper: str, step: str,
-               body: List[Statement]):
+               body: List[Statement],
+               iter_args: Sequence[Tuple[str, str, str]] = (),
+               results: Sequence[str] = (),
+               yield_values: Sequence[str] = (),
+               yield_types: Sequence[str] = ()):
     self.iv = iv
     self.lower = lower
     self.upper = upper
     self.step = step
     self.body = body
+    self.iter_args = iter_args
+    self.results = results
+    self.yield_values = yield_values
+    self.yield_types = yield_types
 
   def render(self, indent: str) -> str:
-    lines = [f"{indent}scf.for {self.iv} = {self.lower} to {self.upper} step {self.step} {{"]
+    iter_part = ""
+    result_part = ""
+    if self.iter_args:
+      args_def = ", ".join(f"{name} = {init}" for name, init, _ in self.iter_args)
+      types = ", ".join(typ for _, _, typ in self.iter_args)
+      iter_part = f" iter_args({args_def}) -> ({types})"
+
+      if self.results:
+        res_names = ", ".join(self.results)
+        result_part = f"{res_names} = "
+
+    lines = [f"{indent}{result_part}scf.for {self.iv} = {self.lower} to {self.upper} step {self.step}{iter_part} {{"]
     inner = indent + "  "
     for stmt in self.body:
       lines.append(stmt.render(inner))
-    lines.append(f"{inner}scf.yield")
+
+    if self.yield_values:
+      vals = ", ".join(self.yield_values)
+      typs = ", ".join(self.yield_types)
+      lines.append(f"{inner}scf.yield {vals} : {typs}")
+    else:
+      lines.append(f"{inner}scf.yield")
+
     lines.append(f"{indent}}}")
     return "\n".join(lines)
 
@@ -191,15 +217,15 @@ class TransitionScriptExecutor:
             f"transition script '{self.fn.__name__}' must accept a builder argument"
         ) from exc
     else:
-      params = list(self.signature.parameters.values())
-      if params:
-        first = params[0]
-        if (first.kind in (inspect.Parameter.POSITIONAL_ONLY,
-                           inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            and first.default is inspect._empty):
-          raise TypeError(
-              f"jit transition '{self.fn.__name__}' should not declare an explicit builder argument"
-          )
+      # params = list(self.signature.parameters.values())
+      # if params:
+      #   first = params[0]
+      #   if (first.kind in (inspect.Parameter.POSITIONAL_ONLY,
+      #                      inspect.Parameter.POSITIONAL_OR_KEYWORD)
+      #       and first.default is inspect._empty):
+      #     raise TypeError(
+      #         f"jit transition '{self.fn.__name__}' should not declare an explicit builder argument"
+      #     )
       bound = self.signature.bind_partial(*args, **kwargs)
 
     bound.apply_defaults()
@@ -210,8 +236,9 @@ class TransitionScriptExecutor:
     self.locals.update(closure_vars.nonlocals)
     builder_globals = self._collect_builder_globals(builder)
     for name, value in builder_globals.items():
-      if name != "builder" and name not in self.locals:
-        self.locals[name] = value
+      if name == "builder":
+        continue
+      self.locals[name] = value
     self.globals: Dict[str, Any] = dict(self.fn.__globals__)
     self.globals.setdefault("__builtins__", __builtins__)
     self.globals.update(builder_globals)
@@ -448,17 +475,41 @@ class TransitionScriptExecutor:
     else:
       raise TypeError("range() expects 1-3 positional arguments in jit loops")
 
-    def loop_body(_builder: "TransitionBuilder", iv_value: Value) -> None:
+    # Find assignments in the loop body
+    finder = AssignmentFinder()
+    finder.visit(node)
+    assigned_vars = sorted(list(finder.assigned))
+
+    iter_args = []
+    iter_arg_names = []
+    for name in assigned_vars:
+      if name in self.locals and isinstance(self.locals[name], Value):
+        iter_args.append(self.locals[name])
+        iter_arg_names.append(name)
+
+    def loop_body(_builder: "TransitionBuilder", iv_value: Value, *args: Value) -> Sequence[Value]:
       saved_locals = self.locals
       loop_locals = dict(saved_locals)
       loop_locals[node.target.id] = iv_value
+      for name, val in zip(iter_arg_names, args):
+        loop_locals[name] = val
       self.locals = loop_locals
       try:
         self._exec_block(node.body)
+        results = []
+        for name in iter_arg_names:
+          results.append(self.locals[name])
+        return results
       finally:
         self.locals = saved_locals
 
-    self.builder.for_range(lower, upper, step=step, body=loop_body)
+    results = self.builder.for_range(lower, upper, step=step, iter_args=iter_args, body=loop_body)
+
+    if iter_args:
+      if not isinstance(results, tuple):
+        results = (results,)
+      for name, val in zip(iter_arg_names, results):
+        self.locals[name] = val
 
 
 @dataclass(frozen=True)
@@ -474,7 +525,7 @@ class Value:
     raise TypeError("LPN SSA values cannot be used as Python booleans")
 
   def _require_numeric(self) -> None:
-    if self.typ not in ("i64", "f64"):
+    if self.typ not in ("i64", "f64", "index"):
       raise TypeError(f"operation not supported on values of type {self.typ}")
 
   def _require_integer_like(self) -> None:
@@ -551,8 +602,20 @@ class Value:
   def __setitem__(self, index: Union["Value", int], value: Union["Value", int, float]) -> None:
     raise TypeError("LPN arrays are immutable SSA values; use 'new_arr = arr.set(index, value)' instead of 'arr[index] = value'.")
 
-  def set(self, index: Union["Value", int], value: Union["Value", int, float]) -> "Value":
+  def set(self, index: Union["Value", int, str, "KeyValue"], value: Union["Value", int, float]) -> "Value":
+    if self.typ == "!lpn.token":
+      return self.builder.token_set(TokenValue(self.builder, self.name), index, value)
     return self.builder.array_set(self, index, value)
+
+  def get(self, key: Union[str, "KeyValue", Value, int]) -> Value:
+    if self.typ == "!lpn.token":
+      return self.builder.token_get(TokenValue(self.builder, self.name), key)
+    raise TypeError(f"get() not supported on values of type {self.typ}")
+
+  def clone(self) -> "TokenValue":
+    if self.typ == "!lpn.token":
+      return self.builder.clone(TokenValue(self.builder, self.name))
+    raise TypeError(f"clone() not supported on values of type {self.typ}")
 
   def len(self) -> "Value":
     return self.builder.array_len(self)
@@ -641,6 +704,17 @@ class TransitionBuilder:
     self._ssa_values[name] = value
     return value
 
+  def _get_or_create_value(self, name: str, typ: str) -> Value:
+    existing = self._ssa_values.get(name)
+    if existing is not None:
+      if existing.typ != typ:
+        raise TypeError(
+            f"SSA value '%{name}' already registered with type {existing.typ}, expected {typ}")
+      return existing
+    value = Value(self, name, typ)
+    self._ssa_values[name] = value
+    return value
+
   def _wrap_token(self, name: str) -> TokenValue:
     return TokenValue(self, name)
 
@@ -676,6 +750,8 @@ class TransitionBuilder:
       return value
     if isinstance(value, KeyValue):
       return value.as_value()
+    if isinstance(value, TokenValue):
+      return self._ensure_token_value(value)
     if isinstance(value, PlaceHandle):
       return self._ensure_place_handle(value)
     if isinstance(value, float):
@@ -683,6 +759,35 @@ class TransitionBuilder:
     if isinstance(value, int):
       return self.const_i64(value)
     raise TypeError(f"unsupported element type {type(value)}")
+
+  def _ensure_token_value(self, token: TokenValue) -> Value:
+    if token.builder is not self:
+      raise ValueError("token value belongs to a different builder")
+    return self._get_or_create_value(token.name, "!lpn.token")
+
+  def _coerce_function_argument(self, value: Any, typ: str) -> Value:
+    if typ == "!lpn.token":
+      if isinstance(value, TokenValue):
+        return self._ensure_token_value(value)
+      if isinstance(value, Value) and value.typ == "!lpn.token":
+        return value
+      raise TypeError("expected a TokenValue or !lpn.token SSA value")
+    if typ == "!lpn.place":
+      if isinstance(value, Value) and value.typ == "!lpn.place":
+        return value
+      return self._resolve_place_operand(value)
+    if typ == "!lpn.key":
+      if isinstance(value, KeyValue):
+        return value.as_value()
+      if isinstance(value, Value) and value.typ == "!lpn.key":
+        return value
+      key = self._ensure_key(value)
+      return key.as_value()
+    if isinstance(value, Value):
+      if value.typ != typ:
+        raise TypeError(f"expected value of type {typ}, but got {value.typ}")
+      return value
+    return self._coerce_value(value, typ)
 
   def _resolve_place_operand(self,
                              place: Union[PlaceHandle, Value]) -> Value:
@@ -751,6 +856,15 @@ class TransitionBuilder:
     operand_types = ", ".join(value.typ for value in coerced)
     self._append(f"{name} = lpn.array {operand_names} : {operand_types} -> {array_type}")
     return self._wrap_value(name, array_type)
+
+  def array_alloc(self, size: Union[Value, int], fill_value: Union[Value, int, float]) -> Value:
+    sz = self._coerce_value(size, "index")
+    fill = self._coerce_array_element(fill_value)
+    name = self._next_value()
+    typ = f"!lpn.array<{fill.typ}>"
+    self._append(f"{name} = lpn.array.alloc {sz.name}, {fill.name} : {sz.typ}, {fill.typ} -> {typ}")
+    return self._wrap_value(name, typ)
+
 
   def array_get(self,
                 array_value: Value,
@@ -1051,6 +1165,23 @@ class TransitionBuilder:
       self._ops = saved_ops
     return branch_ops
 
+  def _capture_ops_and_results(
+      self,
+      fn: Optional[Callable[..., Any]],
+      *fn_args: Any
+  ) -> Tuple[List[Statement], Any]:
+    if fn is None:
+      return [], None
+    saved_ops = self._ops
+    branch_ops: List[Statement] = []
+    self._ops = branch_ops
+    result = None
+    try:
+      result = fn(self, *fn_args)
+    finally:
+      self._ops = saved_ops
+    return branch_ops, result
+
   def if_op(
       self,
       cond: Union[Value, str],
@@ -1138,7 +1269,7 @@ class TransitionBuilder:
 
   def token_get(self,
                 token: TokenValue,
-                key: Union[str, KeyValue, Value, int]
+                key: Union[str, RuntimeKey, int]
                 ) -> Value:
     key_value = self._ensure_key(key)
     name = self._next_value()
@@ -1209,15 +1340,92 @@ class TransitionBuilder:
                 upper: Union[Value, int],
                 *,
                 step: Union[Value, int] = 1,
-                body: Callable[['TransitionBuilder', Value], None]) -> None:
+                iter_args: Sequence[Value] = (),
+                body: Callable[..., Any]) -> Sequence[Value]:
     lb = self._coerce_value(lower, "index")
     ub = self._coerce_value(upper, "index")
     st = self._coerce_value(step, "index")
     iv_name = self._next_value()
     iv_value = self._wrap_value(iv_name, "index")
-    body_ops = self._capture_ops(body, iv_value)
+
+    # Prepare iter_args for ForStatement
+    iter_args_info = []
+    for arg in iter_args:
+      iter_args_info.append((self._next_value(), arg.name, arg.typ))
+
+    # Prepare block args for body
+    block_args = [iv_value]
+    for name, _, typ in iter_args_info:
+      block_args.append(self._wrap_value(name, typ))
+
+    body_ops, body_results = self._capture_ops_and_results(body, *block_args)
+
+    yield_values = []
+    yield_types = []
+    if iter_args:
+      if not isinstance(body_results, (list, tuple)):
+        body_results = [body_results]
+      if len(body_results) != len(iter_args):
+        raise ValueError(f"for_range body must return {len(iter_args)} values, got {len(body_results)}")
+      for res in body_results:
+        if not isinstance(res, Value):
+           raise TypeError(f"for_range body must return Values, got {type(res)}")
+        yield_values.append(res.name)
+        yield_types.append(res.typ)
+
+    results = []
+    result_names = []
+    if iter_args:
+      for _, _, typ in iter_args_info:
+        name = self._next_value()
+        result_names.append(name)
+        results.append(self._wrap_value(name, typ))
+
     self._ops.append(
-        ForStatement(iv_name, lb.name, ub.name, st.name, body_ops))
+        ForStatement(iv_name, lb.name, ub.name, st.name, body_ops,
+                     iter_args=iter_args_info,
+                     results=result_names,
+                     yield_values=yield_values,
+                     yield_types=yield_types))
+
+    if len(results) == 1:
+      return results[0]
+    return tuple(results)
+
+  def _call_helper(self,
+                   function: "FunctionDef",
+                   args: Sequence[Any]) -> Optional[Union[Value, TokenValue, Tuple[Union[Value, TokenValue], ...]]]:
+    arg_types = [arg.typ for arg in function.builder.arguments]
+    if len(args) != len(arg_types):
+      raise TypeError(
+          f"helper '{function.name}' expected {len(arg_types)} arguments, got {len(args)}")
+    operands = [
+        self._coerce_function_argument(value, typ)
+        for value, typ in zip(args, arg_types)
+    ]
+    operand_names = ", ".join(value.name for value in operands)
+    operand_types = ", ".join(value.typ for value in operands)
+    result_types = list(function.builder.result_types)
+    result_sig = ", ".join(result_types)
+    result_names: List[str] = []
+    assign_prefix = ""
+    if result_types:
+      result_names = [self._next_value() for _ in result_types]
+      assigned = ", ".join(result_names)
+      assign_prefix = f"{assigned} = "
+    self._append(
+        f"{assign_prefix}func.call @{function.name}({operand_names}) : ({operand_types}) -> ({result_sig})")
+    results: List[Union[Value, TokenValue]] = []
+    for name, typ in zip(result_names, result_types):
+      if typ == "!lpn.token":
+        results.append(self._wrap_token(name))
+      else:
+        results.append(self._wrap_value(name, typ))
+    if not results:
+      return None
+    if len(results) == 1:
+      return results[0]
+    return tuple(results)
 
   def render(self) -> List[str]:
     ops = []
@@ -1301,12 +1509,83 @@ class FuncBuilder(TransitionBuilder):
 class NetBuilder:
   """Tiny DSL for emitting the new MLIR dialect."""
 
+  _TYPE_ALIASES = {
+      "token": "!lpn.token",
+      "tokenvalue": "!lpn.token",
+      "token_value": "!lpn.token",
+      "place": "!lpn.place",
+      "placehandle": "!lpn.place",
+      "key": "!lpn.key",
+      "runtimekey": "!lpn.key",
+      "i64": "i64",
+      "index": "index",
+      "f64": "f64",
+  }
+
   def __init__(self, name: str = "net"):
     self.name = name
     self._places: List[tuple[PlaceHandle, Optional[int], Optional[int], bool]] = []
     self._transitions: List[TransitionDef] = []
     self._helper_functions: Dict[str, List[str]] = {}
     self._functions: List["FunctionDef"] = []
+    self._function_map: Dict[str, "FunctionDef"] = {}
+
+  def _make_helper_stub(self,
+                        builder: TransitionBuilder,
+                        function: "FunctionDef") -> Callable[..., Any]:
+    def _helper(*args: Any) -> Any:
+      return builder._call_helper(function, args)
+    _helper.__name__ = function.name
+    _helper.__qualname__ = function.name
+    return _helper
+
+  def _register_function_def(self, function: "FunctionDef") -> None:
+    if function.name in self._function_map:
+      raise ValueError(f"helper function '{function.name}' already defined")
+    self._functions.append(function)
+    self._function_map[function.name] = function
+
+  def _unregister_function_def(self, function: "FunctionDef") -> None:
+    existing = self._function_map.get(function.name)
+    if existing is function:
+      self._function_map.pop(function.name, None)
+    if function in self._functions:
+      self._functions.remove(function)
+
+  def _bind_helper_stubs(self, builder: TransitionBuilder) -> None:
+    if not self._functions:
+      return
+    for function in self._functions:
+      setattr(builder, function.name, self._make_helper_stub(builder, function))
+
+  def _normalize_type_spec(self, spec: Any) -> str:
+    if isinstance(spec, str):
+      cleaned = spec.strip()
+      alias_key = cleaned.lower().replace(" ", "")
+      array_match = re.fullmatch(r"list\[(.+)\]", alias_key)
+      if array_match:
+        inner = self._normalize_type_spec(array_match.group(1))
+        return f"!lpn.array<{inner}>"
+      if cleaned.startswith("!lpn") or cleaned in ("i64", "index", "f64"):
+        return cleaned
+      alias_value = NetBuilder._TYPE_ALIASES.get(alias_key)
+      if alias_value:
+        return alias_value
+      raise ValueError(
+          f"unsupported helper type alias '{spec}'; expected full MLIR type or one of {sorted(NetBuilder._TYPE_ALIASES.keys())}")
+    origin = get_origin(spec)
+    if origin in (list, List, Sequence, tuple):
+      args = get_args(spec)
+      if len(args) != 1:
+        raise TypeError("List[...] helper aliases must have one argument")
+      inner = self._normalize_type_spec(args[0])
+      return f"!lpn.array<{inner}>"
+    if spec in (TokenValue, Value):
+      return "!lpn.token"
+    if spec is PlaceHandle:
+      return "!lpn.place"
+    raise TypeError(
+        f"unsupported helper type specification {spec!r}")
 
   def place(self,
             name: str,
@@ -1318,6 +1597,16 @@ class NetBuilder:
     self._places.append((handle, capacity, initial_tokens, observable))
     return handle
 
+  def _run_jit_script(self,
+                      fn: Callable[[TransitionBuilder], None],
+                      builder: TransitionBuilder,
+                      *,
+                      require_builder_arg: bool,
+                      extra_args: Sequence[Any] = ()) -> None:
+    executor = TransitionScriptExecutor(fn,
+                                        require_builder_arg=require_builder_arg)
+    executor(builder, *extra_args)
+
   def _make_transition(self,
                        name: str,
                        *,
@@ -1326,10 +1615,11 @@ class NetBuilder:
                        ) -> Callable[[Callable[[TransitionBuilder], None]], Callable[[TransitionBuilder], None]]:
     def decorator(fn: Callable[[TransitionBuilder], None]):
       builder = TransitionBuilder(name, owner=self)
+      self._bind_helper_stubs(builder)
       if script:
-        executor = TransitionScriptExecutor(
-            fn, require_builder_arg=not jit)
-        executor(builder)
+        self._run_jit_script(fn,
+                             builder,
+                             require_builder_arg=not jit)
       else:
         fn(builder)
       definition = TransitionDef(name=name,
@@ -1361,13 +1651,13 @@ class NetBuilder:
   def func(self,
            name: Optional[Union[str, Callable]] = None,
            *,
-           args: Sequence[Union[str, Tuple[str, str]]] = (),
-           results: Sequence[str] = (),
+           args: Sequence[Union[str, Tuple[str, Any]]] = (),
+           results: Sequence[Any] = (),
            private: bool = True):
     """Define a helper MLIR `func.func` using the DSL."""
 
     def normalize_args(
-        specs: Sequence[Union[str, Tuple[str, str]]]
+        specs: Sequence[Union[str, Tuple[str, Any]]]
     ) -> Tuple[List[str], List[str]]:
       labels: List[str] = []
       types: List[str] = []
@@ -1390,7 +1680,7 @@ class NetBuilder:
           candidate = f"{base}_{suffix}"
         used[candidate] = 1
         labels.append(candidate)
-        types.append(typ)
+        types.append(self._normalize_type_spec(typ))
       return labels, types
 
     def build(actual_name: str,
@@ -1400,13 +1690,45 @@ class NetBuilder:
       builder = FuncBuilder(actual_name,
                             owner=self,
                             arg_types=arg_types,
-                            result_types=list(results),
+                            result_types=[self._normalize_type_spec(r)
+                                          for r in results],
                             arg_names=ssa_names)
-      executor = TransitionScriptExecutor(fn, require_builder_arg=False)
-      executor(builder, *builder.arguments)
       visibility = "private" if private else "public"
-      self._functions.append(FunctionDef(actual_name, builder, visibility))
-      return fn
+      function_def = FunctionDef(actual_name, builder, visibility)
+      self._register_function_def(function_def)
+      try:
+        self._bind_helper_stubs(builder)
+        self._run_jit_script(fn,
+                             builder,
+                             require_builder_arg=False,
+                             extra_args=builder.arguments)
+      except Exception:
+        self._unregister_function_def(function_def)
+        raise
+
+      def wrapper(*args, **kwargs):
+        builder = None
+        for arg in args:
+          if isinstance(arg, (Value, TokenValue, KeyValue)):
+            builder = arg.builder
+            break
+        if builder is None:
+          for arg in kwargs.values():
+            if isinstance(arg, (Value, TokenValue, KeyValue)):
+              builder = arg.builder
+              break
+
+        if builder is not None:
+          if kwargs:
+            raise TypeError("keyword arguments are not supported in JIT helper calls")
+          return builder._call_helper(function_def, args)
+
+        try:
+          return fn(*args, **kwargs)
+        except FunctionReturn as e:
+          return e.value
+
+      return wrapper
 
     if callable(name):
       fn = name  # type: ignore[assignment]
@@ -1648,10 +1970,20 @@ class PythonRuntimeAPI:
   def array(self,
             *elements: Union[Value, PlaceHandle, int, float,
                              Sequence[Union[Value, PlaceHandle, int, float]]]
-            ) -> tuple[Any, ...]:
+            ) -> tuple:
     if len(elements) == 1 and isinstance(elements[0], (list, tuple)):
       elements = tuple(elements[0])
     return tuple(elements)
+
+  def array_alloc(self, size: Union[int, Value], fill_value: Any) -> list:
+    sz = int(size)
+    return [fill_value for _ in range(sz)]
+
+  def array_set(self, array_value: Sequence[Any], index: int, value: Any) -> list:
+    idx = int(index)
+    lst = list(array_value)
+    lst[idx] = value
+    return lst
 
   def array_get(self,
                 array_value: Sequence[Any],
@@ -1764,7 +2096,7 @@ class PythonRuntimeAPI:
                 upper: Union[int, float],
                 *,
                 step: Union[int, float] = 1,
-                body: Callable[['PythonRuntimeAPI', int], None]) -> None:
+                body: Callable [['PythonRuntimeAPI', int], None]) -> None:
     lb = int(lower)
     ub = int(upper)
     st = int(step)
@@ -1773,12 +2105,19 @@ class PythonRuntimeAPI:
 
   def if_op(self,
             cond: Union[bool, int],
-            true_fn: Callable[['PythonRuntimeAPI'], None],
-            false_fn: Optional[Callable[['PythonRuntimeAPI'], None]] = None) -> None:
+            true_fn: Callable [['PythonRuntimeAPI'], None],
+            false_fn: Optional[Callable [['PythonRuntimeAPI'], None]] = None) -> None:
     if bool(cond):
       true_fn(self)
     elif false_fn:
       false_fn(self)
+
+  def func_return(self, *values: Any) -> None:
+    if not values:
+      raise FunctionReturn(None)
+    if len(values) == 1:
+      raise FunctionReturn(values[0])
+    raise FunctionReturn(values)
 
   def exported_symbols(self) -> Dict[str, Any]:
     mapping: Dict[str, Any] = {}
@@ -1999,3 +2338,28 @@ class PythonSimulator:
     place = blocked_reason.place if blocked_reason else "<unknown>"
     raise RuntimeError(
         f"transition '{definition.name}' blocked on place '{place}'")
+
+
+class FunctionReturn(Exception):
+  def __init__(self, value: Any):
+    self.value = value
+
+
+class AssignmentFinder(ast.NodeVisitor):
+  def __init__(self):
+    self.assigned = set()
+
+  def visit_Assign(self, node: ast.Assign) -> None:
+    for target in node.targets:
+      if isinstance(target, ast.Name):
+        self.assigned.add(target.id)
+      elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+        self.assigned.add(target.value.id)
+    self.generic_visit(node)
+
+  def visit_AugAssign(self, node: ast.AugAssign) -> None:
+    if isinstance(node.target, ast.Name):
+      self.assigned.add(node.target.id)
+    elif isinstance(node.target, ast.Subscript) and isinstance(node.target.value, ast.Name):
+      self.assigned.add(node.target.value.id)
+    self.generic_visit(node)

@@ -186,6 +186,13 @@ def ArrayLenOp : LPN_Op<"array.len", [Pure]> {
     "$array attr-dict `:` type($array) `->` type($length)";
 }
 
+def ArrayAllocOp : LPN_Op<"array.alloc", [Pure]> {
+  let summary = "Allocate a new array of given size";
+  let arguments = (ins Index:$size, AnyType:$fill_value);
+  let results = (outs ArrayType:$result);
+  let assemblyFormat = "$size `,` $fill_value attr-dict `:` type($size) `,` type($fill_value) `->` type($result)";
+}
+
 //===----------------------------------------------------------------------===//
 // Token flow primitives
 //===----------------------------------------------------------------------===//
