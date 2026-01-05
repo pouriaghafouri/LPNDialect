@@ -990,20 +990,20 @@ struct LPNRetainHypergraphPass
       if (entry.second.empty())
         continue;
       std::string transName = (entry.first.getValue() + "_retain").str();
-      auto trans =
-          topBuilder.create<TransitionOp>(net.getLoc(),
-                                          topBuilder.getStringAttr(transName));
-      Region &region = trans.getBody();
+    ImplicitLocOpBuilder builder(net.getLoc(), ctx);
+    builder.setInsertionPointToStart(&body); // Will reset below
+    TransitionOp trans = builder.create<TransitionOp>(
+      topBuilder.getStringAttr(transName));
+    Region &region = trans.getBody();
       auto *block = new Block();
       region.push_back(block);
-      ImplicitLocOpBuilder builder(net.getLoc(), ctx);
+    builder.setInsertionPointToStart(block);
       builder.setInsertionPointToStart(block);
       auto placeRef = builder.create<PlaceRefOp>(
           PlaceType::get(ctx), FlatSymbolRefAttr::get(entry.first));
       Value seed = builder.create<TakeOp>(TokenType::get(ctx), placeRef);
       SmallVector<CursorState, 8> states;
       TokenEnv seedTokens;
-      seedTokens[entry.first] = SmallVector<Value>{seed};
       for (const EdgePath &path : entry.second) {
         CursorState state;
         state.cursor = PathCursor{&path, 0, 0};
@@ -1178,6 +1178,8 @@ LogicalResult LPNRetainHypergraphPass::emitIfGroup(ContextGroup &group,
       for (CursorState &state : branchStates) {
         CursorState next = std::move(state);
         next.cursor.contextIndex++;
+        next.tokens = condTokens;
+        next.takes = condTakes;
         advanced.push_back(std::move(next));
       }
       if (failed(emitCursorSet(std::move(advanced), branchBuilder)))
@@ -1203,6 +1205,15 @@ LogicalResult LPNRetainHypergraphPass::emitChoiceGroup(ContextGroup &group,
   if (!choice)
     return builder.getInsertionBlock()->getParentOp()->emitError(
         "unsupported choice context");
+  TokenEnv choiceTokens;
+  TakeEnv choiceTakes;
+  if (!group.thenStates.empty()) {
+    choiceTokens = group.thenStates.front().tokens;
+    choiceTakes = group.thenStates.front().takes;
+  } else if (!group.elseStates.empty()) {
+    choiceTokens = group.elseStates.front().tokens;
+    choiceTakes = group.elseStates.front().takes;
+  }
   ChoiceOp cloned = builder.create<ChoiceOp>();
   auto populate = [&](Region &region,
                       SmallVector<CursorState, 4> branchStates)
@@ -1218,6 +1229,8 @@ LogicalResult LPNRetainHypergraphPass::emitChoiceGroup(ContextGroup &group,
       for (CursorState &state : branchStates) {
         CursorState next = std::move(state);
         next.cursor.contextIndex++;
+        next.tokens = choiceTokens;
+        next.takes = choiceTakes;
         advanced.push_back(std::move(next));
       }
       if (failed(emitCursorSet(std::move(advanced), branchBuilder)))
@@ -1270,6 +1283,8 @@ LogicalResult LPNRetainHypergraphPass::emitForGroup(ContextGroup &group,
     CursorState next = std::move(state);
     next.cursor.contextIndex++;
     next.ssa[forOp.getBody()->getArgument(0)] = cloned.getInductionVar();
+    next.tokens = loopTokens;
+    next.takes = loopTakes;
     advanced.push_back(std::move(next));
   }
   if (failed(emitCursorSet(std::move(advanced), inner)))

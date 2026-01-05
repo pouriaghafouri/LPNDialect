@@ -31,3 +31,9 @@ PYTHONPATH=. python3 examples/network_net.py > /tmp/network_net.mlir
   --lpn-retain-hypergraph --lpn-strip-hidden-values \
   --lpn-resolve-choices --canonicalize --cse \
   --lpn-dataflow-simplify /tmp/network_net.mlir > /tmp/network_net_after.mlir
+
+PYTHONPATH=. python3 examples/strip_demo.py > /tmp/strip_demo_branch.mlir
+./build/tools/lpn-opt/lpn-opt --mlir-print-ir-after-all --lpn-synthesize-guards --lpn-normalize-delays \
+  --lpn-retain-hypergraph --lpn-strip-hidden-values \
+  --lpn-resolve-choices --canonicalize --cse \
+  --lpn-dataflow-simplify /tmp/strip_demo_branch.mlir > /tmp/strip_demo_after.mlir 2> /tmp/strip_demo_pass_debug.log

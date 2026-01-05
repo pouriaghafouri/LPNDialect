@@ -238,7 +238,7 @@ class TransitionScriptExecutor:
     for name, value in builder_globals.items():
       if name == "builder":
         continue
-      self.locals[name] = value
+      self.locals.setdefault(name, value)
     self.globals: Dict[str, Any] = dict(self.fn.__globals__)
     self.globals.setdefault("__builtins__", __builtins__)
     self.globals.update(builder_globals)
